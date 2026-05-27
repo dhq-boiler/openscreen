@@ -64,6 +64,7 @@ import {
 	hasProjectUnsavedChanges,
 	normalizeProjectEditor,
 	resolveProjectMedia,
+	resolveProjectMediaV3,
 	toFileUrl,
 	validateProjectData,
 } from "./projectPersistence";
@@ -181,6 +182,11 @@ export default function VideoEditor() {
 
 	// ── Non-undoable state
 	const [videoPath, setVideoPath] = useState<string | null>(null);
+	// Phase 3: additional layer file URLs (only populated for v3 multi-layer
+	// projects). Each entry is a file:// URL ready for an HTMLVideoElement
+	// `src`. The primary layer continues to flow through `videoPath` so the
+	// rest of the editor (zoom/cursor/etc.) keeps treating it as canonical.
+	const [additionalLayerPaths, setAdditionalLayerPaths] = useState<string[]>([]);
 	const [videoSourcePath, setVideoSourcePath] = useState<string | null>(null);
 	const [webcamVideoPath, setWebcamVideoPath] = useState<string | null>(null);
 	const [webcamVideoSourcePath, setWebcamVideoSourcePath] = useState<string | null>(null);
@@ -325,6 +331,17 @@ export default function VideoEditor() {
 			const sourcePath = projectMedia.screenVideoPath;
 			const webcamSourcePath = projectMedia.webcamVideoPath ?? null;
 			const projectCursorCaptureMode = projectMedia.cursorCaptureMode ?? null;
+
+			// Phase 3: pick up additional layers from v3 media so the editor
+			// can show all recorded windows side-by-side. The primary layer
+			// (index 0) keeps flowing through the existing single-source
+			// state to preserve all the existing zoom/cursor/effect plumbing.
+			const projectMediaV3 = resolveProjectMediaV3(project);
+			const extraLayerPaths =
+				projectMediaV3 && projectMediaV3.layers.length > 1
+					? projectMediaV3.layers.slice(1).map((layer) => toFileUrl(layer.screenVideoPath))
+					: [];
+			setAdditionalLayerPaths(extraLayerPaths);
 			const normalizedEditor = normalizeProjectEditor(project.editor);
 			const inferredDurationMs = Math.max(
 				0,
@@ -1565,6 +1582,18 @@ export default function VideoEditor() {
 				return;
 			}
 
+			// Phase 3 known limitation: the export pipeline composes one
+			// VideoFrame at a time, so additional v3 layers are not yet
+			// baked into the output. Warn the user up front rather than
+			// silently dropping them.
+			if (additionalLayerPaths.length > 0) {
+				toast.warning(
+					`Exporting primary layer only — ${additionalLayerPaths.length} additional layer${
+						additionalLayerPaths.length === 1 ? " is" : "s are"
+					} visible in the editor but not yet composed into the exported video (Phase 3.5 follow-up).`,
+				);
+			}
+
 			// Ask the user where to save BEFORE starting the export. This avoids the
 			// post-export save dialog getting hidden behind other windows after a
 			// long-running export.
@@ -2076,10 +2105,11 @@ export default function VideoEditor() {
 											}}
 										>
 											<VideoPlayback
-												key={`${videoPath || "no-video"}:${webcamVideoPath || "no-webcam"}`}
+												key={`${videoPath || "no-video"}:${webcamVideoPath || "no-webcam"}:${additionalLayerPaths.length}`}
 												aspectRatio={aspectRatio}
 												ref={videoPlaybackRef}
 												videoPath={videoPath || ""}
+												additionalLayerPaths={additionalLayerPaths}
 												webcamVideoPath={webcamVideoPath || undefined}
 												webcamLayoutPreset={webcamLayoutPreset}
 												webcamMaskShape={webcamMaskShape}

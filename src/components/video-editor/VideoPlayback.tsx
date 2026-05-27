@@ -100,6 +100,14 @@ import {
 
 interface VideoPlaybackProps {
 	videoPath: string;
+	/**
+	 * Phase 3: extra video layers loaded from a v3 multi-layer project.
+	 * Rendered as DOM `<video>` elements overlaid on top of the PixiJS
+	 * canvas in a simple grid. They do NOT yet flow through the PixiJS
+	 * pipeline, so they're visible in the editor but not yet baked into
+	 * exports (Phase 3.5+ pulls them into FrameRenderer).
+	 */
+	additionalLayerPaths?: string[];
 	webcamVideoPath?: string;
 	webcamLayoutPreset: WebcamLayoutPreset;
 	webcamMaskShape?: import("./types").WebcamMaskShape;
@@ -224,6 +232,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 	(
 		{
 			videoPath,
+			additionalLayerPaths = [],
 			webcamVideoPath,
 			webcamLayoutPreset,
 			webcamMaskShape,
@@ -2101,10 +2110,82 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				{supplementalAudioPath && (
 					<audio ref={supplementalAudioRef} src={supplementalAudioPath} preload="auto" />
 				)}
+				<MultiLayerOverlay
+					paths={additionalLayerPaths}
+					isPlaying={isPlaying}
+					currentTime={currentTime}
+				/>
 			</div>
 		);
 	},
 );
+
+/**
+ * Phase 3 minimum: show extra recorded layers as a small picture-strip
+ * along the top of the editor preview. Each video is muted, synced to the
+ * primary playhead, and not part of the export pipeline (that's tracked
+ * in the design doc as a Phase 3.5/6 follow-up).
+ */
+function MultiLayerOverlay({
+	paths,
+	isPlaying,
+	currentTime,
+}: {
+	paths: string[];
+	isPlaying: boolean;
+	currentTime: number;
+}) {
+	const videoRefs = useRef<(HTMLVideoElement | null)[]>([]);
+
+	useEffect(() => {
+		for (const video of videoRefs.current) {
+			if (!video) continue;
+			if (Math.abs(video.currentTime - currentTime) > 0.25) {
+				try {
+					video.currentTime = currentTime;
+				} catch {
+					// Seek may fail before metadata loads — next tick will retry.
+				}
+			}
+			if (isPlaying && video.paused) {
+				video.play().catch(() => undefined);
+			} else if (!isPlaying && !video.paused) {
+				video.pause();
+			}
+		}
+	}, [isPlaying, currentTime]);
+
+	if (paths.length === 0) return null;
+
+	return (
+		<div className="pointer-events-none absolute right-4 top-4 flex gap-2" style={{ zIndex: 30 }}>
+			{paths.map((path, idx) => (
+				<div
+					key={`${path}-${idx}`}
+					className="overflow-hidden rounded-md border border-white/20 bg-black/60 shadow-lg"
+					style={{ width: 160, aspectRatio: "16/9" }}
+				>
+					<video
+						ref={(el) => {
+							videoRefs.current[idx] = el;
+						}}
+						src={path}
+						muted
+						playsInline
+						preload="auto"
+						className="h-full w-full object-cover"
+					/>
+				</div>
+			))}
+			<div
+				className="pointer-events-none absolute -bottom-5 right-0 text-[10px] text-white/60"
+				style={{ textShadow: "0 1px 2px rgba(0,0,0,0.8)" }}
+			>
+				{`+${paths.length} layer${paths.length === 1 ? "" : "s"} (preview only, not yet in export)`}
+			</div>
+		</div>
+	);
+}
 
 VideoPlayback.displayName = "VideoPlayback";
 
