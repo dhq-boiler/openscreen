@@ -20,6 +20,10 @@
  * - Audio mixing across sessions (Phase 6).
  */
 
+import {
+	type DisplayMediaWindowCaptureHandle,
+	startDisplayMediaWindowCapture,
+} from "./displayMediaWindowCapture";
 import type { NativeMacRecordingRequest } from "./nativeMacRecording";
 import type {
 	NativeWindowsRecordingRequest,
@@ -27,7 +31,7 @@ import type {
 } from "./nativeWindowsRecording";
 import type { ProjectMediaV3, VideoLayer, WebcamLayer } from "./recordingSession";
 
-export type RecordingPlatform = "win32" | "darwin";
+export type RecordingPlatform = "win32" | "darwin" | "display-media";
 
 export interface MultiSourceTargetCommon {
 	/** Stable id used by editor layer transforms and zoom regions. */
@@ -48,7 +52,26 @@ export interface MultiSourceTargetMac extends MultiSourceTargetCommon {
 	request: NativeMacRecordingRequest;
 }
 
-export type MultiSourceTarget = MultiSourceTargetWindows | MultiSourceTargetMac;
+/**
+ * Phase 7: getUserMedia + MediaRecorder based fallback for GPU-rendered
+ * windows that WGC + PrintWindow + BitBlt can't reach (Win11 Notepad,
+ * Electron apps, anything DirectComposition). Recorder runs in the
+ * renderer; the resulting blob is persisted via the
+ * save-display-media-recording IPC.
+ */
+export interface MultiSourceTargetDisplayMedia extends MultiSourceTargetCommon {
+	platform: "display-media";
+	sourceId: string;
+	outputPath: string;
+	fps: number;
+	maxWidth?: number;
+	maxHeight?: number;
+}
+
+export type MultiSourceTarget =
+	| MultiSourceTargetWindows
+	| MultiSourceTargetMac
+	| MultiSourceTargetDisplayMedia;
 
 export interface MultiSourceRecordingHandle {
 	sessionId: string;
@@ -63,6 +86,8 @@ interface ActiveLayerState {
 	target: MultiSourceTarget;
 	screenVideoPath: string;
 	webcamVideoPath?: string;
+	/** Phase 7: in-process handle for display-media targets (null for native). */
+	displayMediaHandle?: DisplayMediaWindowCaptureHandle;
 }
 
 /**
@@ -98,7 +123,20 @@ function getElectronAPI() {
 	return window.electronAPI;
 }
 
-async function startOneTarget(target: MultiSourceTarget): Promise<string> {
+async function startOneTarget(
+	target: MultiSourceTarget,
+): Promise<{ screenVideoPath: string; displayMediaHandle?: DisplayMediaWindowCaptureHandle }> {
+	if (target.platform === "display-media") {
+		const handle = await startDisplayMediaWindowCapture({
+			sourceId: target.sourceId,
+			outputPath: target.outputPath,
+			fps: target.fps,
+			maxWidth: target.maxWidth,
+			maxHeight: target.maxHeight,
+		});
+		return { screenVideoPath: target.outputPath, displayMediaHandle: handle };
+	}
+
 	const api = getElectronAPI();
 	// Force-override the request's recordingId so we own id allocation.
 	const request = {
@@ -122,13 +160,25 @@ async function startOneTarget(target: MultiSourceTarget): Promise<string> {
 			`${target.platform} recording for layer ${target.layerId} returned no output path.`,
 		);
 	}
-	return path;
+	return { screenVideoPath: path };
 }
 
 async function stopOneTarget(
-	target: MultiSourceTarget,
+	state: ActiveLayerState,
 	options: { discard?: boolean } | undefined,
 ): Promise<{ screenVideoPath: string | null; webcamVideoPath?: string }> {
+	const target = state.target;
+	if (target.platform === "display-media") {
+		if (state.displayMediaHandle) {
+			const result = await state.displayMediaHandle.stop();
+			if (options?.discard) {
+				return { screenVideoPath: null };
+			}
+			return { screenVideoPath: result.outputPath };
+		}
+		return { screenVideoPath: null };
+	}
+
 	const api = getElectronAPI();
 	const payload = { discard: Boolean(options?.discard), recordingId: target.recordingId };
 	const result =
@@ -151,7 +201,12 @@ async function stopOneTarget(
 	};
 }
 
-async function pauseOneTarget(target: MultiSourceTarget): Promise<void> {
+async function pauseOneTarget(state: ActiveLayerState): Promise<void> {
+	const target = state.target;
+	if (target.platform === "display-media") {
+		state.displayMediaHandle?.pause();
+		return;
+	}
 	const api = getElectronAPI();
 	const result =
 		target.platform === "win32"
@@ -162,7 +217,12 @@ async function pauseOneTarget(target: MultiSourceTarget): Promise<void> {
 	}
 }
 
-async function resumeOneTarget(target: MultiSourceTarget): Promise<void> {
+async function resumeOneTarget(state: ActiveLayerState): Promise<void> {
+	const target = state.target;
+	if (target.platform === "display-media") {
+		state.displayMediaHandle?.resume();
+		return;
+	}
 	const api = getElectronAPI();
 	const result =
 		target.platform === "win32"
@@ -220,7 +280,11 @@ export async function startMultiSourceRecording(
 	for (let i = 0; i < startResults.length; i++) {
 		const result = startResults[i];
 		if (result.status === "fulfilled") {
-			success.push({ target: targets[i], screenVideoPath: result.value });
+			success.push({
+				target: targets[i],
+				screenVideoPath: result.value.screenVideoPath,
+				displayMediaHandle: result.value.displayMediaHandle,
+			});
 		} else {
 			failureIndices.push(i);
 		}
@@ -228,7 +292,7 @@ export async function startMultiSourceRecording(
 
 	if (failureIndices.length > 0) {
 		// Roll back any that did start so we don't leak helpers.
-		await Promise.allSettled(success.map((s) => stopOneTarget(s.target, { discard: true })));
+		await Promise.allSettled(success.map((s) => stopOneTarget(s, { discard: true })));
 		throw aggregateLayerErrors(startResults, "start") ?? new Error("Multi-source start failed.");
 	}
 
@@ -247,13 +311,13 @@ function makeHandle(
 		layerIds,
 		async pauseAll() {
 			if (!alive) throw new Error("Multi-source recording is no longer active.");
-			const results = await Promise.allSettled(active.map((s) => pauseOneTarget(s.target)));
+			const results = await Promise.allSettled(active.map((s) => pauseOneTarget(s)));
 			const err = aggregateLayerErrors(results, "pause");
 			if (err) throw err;
 		},
 		async resumeAll() {
 			if (!alive) throw new Error("Multi-source recording is no longer active.");
-			const results = await Promise.allSettled(active.map((s) => resumeOneTarget(s.target)));
+			const results = await Promise.allSettled(active.map((s) => resumeOneTarget(s)));
 			const err = aggregateLayerErrors(results, "resume");
 			if (err) throw err;
 		},
@@ -262,7 +326,7 @@ function makeHandle(
 			alive = false;
 
 			const stopResults = await Promise.allSettled(
-				active.map((s) => stopOneTarget(s.target, stopOptions)),
+				active.map((s) => stopOneTarget(s, stopOptions)),
 			);
 
 			const layers: VideoLayer[] = [];
@@ -315,7 +379,12 @@ function pickLayerKind(target: MultiSourceTarget): VideoLayer["kind"] {
 	if (target.platform === "win32") {
 		return target.request.source.type === "window" ? "window" : "screen";
 	}
-	// macOS request typing: similar shape.
-	const macSource = (target.request as NativeMacRecordingRequest).source;
-	return macSource.type === "window" ? "window" : "screen";
+	if (target.platform === "darwin") {
+		const macSource = target.request.source;
+		return macSource.type === "window" ? "window" : "screen";
+	}
+	// display-media is always a window capture (desktopCapturer source id
+	// can target screens too, but the Phase 7 flow only routes window
+	// layers through this path).
+	return "window";
 }

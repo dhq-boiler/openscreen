@@ -1491,6 +1491,34 @@ export function registerIpcHandlers(
 		return { success: true, manifestPath, primaryScreenVideoPath: primary.screenVideoPath };
 	});
 
+	// Phase 7: receive a MediaRecorder blob from the renderer (additional
+	// layers captured via getUserMedia + desktopCapturer) and land it in
+	// RECORDINGS_DIR. Path is restricted to that directory + approved for
+	// the rest of the read-path so the editor can load it back.
+	ipcMain.handle(
+		"save-display-media-recording",
+		async (_, payload: { outputPath: string; data: ArrayBuffer }) => {
+			if (!payload?.outputPath || !payload?.data) {
+				return { success: false, error: "Invalid payload" };
+			}
+			const normalized = path.resolve(payload.outputPath);
+			const recordingsDir = path.resolve(RECORDINGS_DIR);
+			if (!normalized.startsWith(recordingsDir + path.sep)) {
+				return {
+					success: false,
+					error: `Output path must live under RECORDINGS_DIR (${recordingsDir})`,
+				};
+			}
+			try {
+				await fs.writeFile(normalized, Buffer.from(payload.data));
+				approveFilePath(normalized);
+				return { success: true, outputPath: normalized };
+			} catch (err) {
+				return { success: false, error: (err as Error).message };
+			}
+		},
+	);
+
 	ipcMain.handle("request-camera-access", async () => {
 		if (process.platform !== "darwin") {
 			return { success: true, granted: true, status: "granted" };
