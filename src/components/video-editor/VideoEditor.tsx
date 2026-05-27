@@ -65,6 +65,7 @@ import {
 	hasProjectUnsavedChanges,
 	type LayerTransform,
 	normalizeProjectEditor,
+	type ProjectEditorState,
 	resolveProjectMedia,
 	resolveProjectMediaV3,
 	toFileUrl,
@@ -336,19 +337,35 @@ export default function VideoEditor() {
 			}
 
 			const project = candidate;
-			const projectMedia = resolveProjectMedia(project);
+			// Phase 3: pick up additional layers from v3 media so the editor
+			// can show all recorded windows side-by-side. The primary layer
+			// (index 0) keeps flowing through the existing single-source
+			// state to preserve all the existing zoom/cursor/effect plumbing.
+			const projectMediaV3 = resolveProjectMediaV3(project);
+			let projectMedia = resolveProjectMedia(project);
+			if (!projectMedia && projectMediaV3 && projectMediaV3.layers[0]) {
+				// Phase 5.5 follow-up: v3-only payload (a fresh multi-source
+				// session that has no v2 shadow yet). Derive a v2-shape media
+				// from the primary layer so the rest of this function keeps
+				// running on the legacy single-source plumbing while the v3
+				// data lights up additionalLayerPaths / layerTransforms.
+				const primary = projectMediaV3.layers[0];
+				projectMedia = {
+					screenVideoPath: primary.screenVideoPath,
+					...(projectMediaV3.webcam
+						? { webcamVideoPath: projectMediaV3.webcam.webcamVideoPath }
+						: {}),
+					...(projectMediaV3.cursorCaptureMode
+						? { cursorCaptureMode: projectMediaV3.cursorCaptureMode }
+						: {}),
+				};
+			}
 			if (!projectMedia) {
 				return false;
 			}
 			const sourcePath = projectMedia.screenVideoPath;
 			const webcamSourcePath = projectMedia.webcamVideoPath ?? null;
 			const projectCursorCaptureMode = projectMedia.cursorCaptureMode ?? null;
-
-			// Phase 3: pick up additional layers from v3 media so the editor
-			// can show all recorded windows side-by-side. The primary layer
-			// (index 0) keeps flowing through the existing single-source
-			// state to preserve all the existing zoom/cursor/effect plumbing.
-			const projectMediaV3 = resolveProjectMediaV3(project);
 			const extraLayerPaths =
 				projectMediaV3 && projectMediaV3.layers.length > 1
 					? projectMediaV3.layers.slice(1).map((layer) => toFileUrl(layer.screenVideoPath))
@@ -545,6 +562,24 @@ export default function VideoEditor() {
 				const currentSessionResult = await window.electronAPI.getCurrentRecordingSession();
 				if (currentSessionResult.success && currentSessionResult.session) {
 					const session = currentSessionResult.session;
+					// Phase 5.5 follow-up: a multi-source v3 session has no
+					// project file yet, so route it through applyLoadedProject
+					// to light up additionalLayerPaths / layerTransforms /
+					// availableLayers in one shot. Single-layer sessions keep
+					// the legacy fast path below.
+					if (currentSessionResult.mediaV3) {
+						const restored = await applyLoadedProject(
+							{
+								version: 3,
+								mediaV3: currentSessionResult.mediaV3,
+								editor: {} as ProjectEditorState,
+							},
+							null,
+						);
+						if (restored) {
+							return;
+						}
+					}
 					const sourcePath = fromFileUrl(session.screenVideoPath);
 					const webcamSourcePath = session.webcamVideoPath
 						? fromFileUrl(session.webcamVideoPath)

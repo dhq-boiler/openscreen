@@ -2830,10 +2830,32 @@ export function registerIpcHandlers(
 		return { success: true, session: currentRecordingSession };
 	});
 
-	ipcMain.handle("get-current-recording-session", () => {
-		return currentRecordingSession
-			? { success: true, session: currentRecordingSession }
-			: { success: false };
+	ipcMain.handle("get-current-recording-session", async () => {
+		if (!currentRecordingSession) {
+			return { success: false };
+		}
+
+		// Phase 5.5 follow-up: if a multi-source v3 manifest sits next to the
+		// primary recording, surface it so the editor can hydrate every layer
+		// straight after Stop (currentProjectPath is null at that point, so
+		// loadCurrentProjectFile cannot help).
+		const manifestPath = path.join(
+			RECORDINGS_DIR,
+			`${path.parse(currentRecordingSession.screenVideoPath).name}${RECORDING_SESSION_SUFFIX}`,
+		);
+		try {
+			const raw = await fs.readFile(manifestPath, "utf-8");
+			const parsed = JSON.parse(raw) as unknown;
+			const mediaV3 = toProjectMediaV3(parsed);
+			if (mediaV3 && mediaV3.layers.length > 1) {
+				return { success: true, session: currentRecordingSession, mediaV3 };
+			}
+		} catch {
+			// No matching manifest, or it isn't a v3 multi-layer one — fall
+			// through to the legacy single-layer response.
+		}
+
+		return { success: true, session: currentRecordingSession };
 	});
 
 	async function setCurrentVideoPath(path: string): Promise<ProjectPathResult> {

@@ -211,6 +211,14 @@ interface Window {
 		getCurrentRecordingSession: () => Promise<{
 			success: boolean;
 			session?: import("../src/lib/recordingSession").RecordingSession;
+			/**
+			 * Phase 5.5 follow-up: when the just-finished session belongs to
+			 * a multi-source v3 manifest, the main process attaches the full
+			 * media so the editor can hydrate all layers without going
+			 * through loadCurrentProjectFile (currentProjectPath is null
+			 * immediately after a record).
+			 */
+			mediaV3?: import("../src/lib/recordingSession").ProjectMediaV3;
 		}>;
 		readBinaryFile: (filePath: string) => Promise<{
 			success: boolean;
