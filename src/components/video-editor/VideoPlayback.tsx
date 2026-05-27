@@ -109,6 +109,25 @@ interface VideoPlaybackProps {
 	 * exports (Phase 3.5+ pulls them into FrameRenderer).
 	 */
 	additionalLayerPaths?: string[];
+	/**
+	 * Phase 4.5: layer ids matched 1:1 with `additionalLayerPaths`. Needed
+	 * for the overlay to resolve which `LayerTransform` belongs to which
+	 * floating tile.
+	 */
+	additionalLayerIds?: string[];
+	/**
+	 * Phase 4.5: normalized per-layer placement (cx, cy in [0,1], size in
+	 * [0,1] relative to stage). When absent or missing entries the overlay
+	 * falls back to a default tile in the top-left.
+	 */
+	layerTransforms?: import("./projectPersistence").LayerTransform[];
+	/** Phase 4.5: streamed drag/resize updates (no checkpoint per frame). */
+	onLayerTransformUpdate?: (
+		layerId: string,
+		partial: Partial<import("./projectPersistence").LayerTransform>,
+	) => void;
+	/** Phase 4.5: pointer-up commit so undo/redo sees one checkpoint per gesture. */
+	onLayerTransformCommit?: () => void;
 	webcamVideoPath?: string;
 	webcamLayoutPreset: WebcamLayoutPreset;
 	webcamMaskShape?: import("./types").WebcamMaskShape;
@@ -234,6 +253,10 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		{
 			videoPath,
 			additionalLayerPaths = [],
+			additionalLayerIds = [],
+			layerTransforms = [],
+			onLayerTransformUpdate,
+			onLayerTransformCommit,
 			webcamVideoPath,
 			webcamLayoutPreset,
 			webcamMaskShape,
@@ -2113,6 +2136,10 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				)}
 				<MultiLayerOverlay
 					paths={additionalLayerPaths}
+					layerIds={additionalLayerIds}
+					transforms={layerTransforms}
+					onUpdate={onLayerTransformUpdate}
+					onCommit={onLayerTransformCommit}
 					isPlaying={isPlaying}
 					currentTime={currentTime}
 				/>
@@ -2126,38 +2153,49 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
  * draggable + resizable picture-in-picture tile floating above the
  * primary PixiJS canvas. Each tile is synced to the primary playhead.
  *
- * Positions/sizes are local to this component for now — Phase 4.5 will
- * lift them into VideoEditor state and useEditorHistory so they survive
- * project saves and join undo/redo.
+ * Phase 4.5: tile positions/sizes live in the editor's undoable history
+ * via `LayerTransform` (normalized 0..1 of the stage). This component is
+ * stateless w.r.t. placement — it only renders transforms and forwards
+ * drag/resize gestures back to VideoEditor.
  */
 function MultiLayerOverlay({
 	paths,
+	layerIds,
+	transforms,
+	onUpdate,
+	onCommit,
 	isPlaying,
 	currentTime,
 }: {
 	paths: string[];
+	layerIds: string[];
+	transforms: import("./projectPersistence").LayerTransform[];
+	onUpdate?: (
+		layerId: string,
+		partial: Partial<import("./projectPersistence").LayerTransform>,
+	) => void;
+	onCommit?: () => void;
 	isPlaying: boolean;
 	currentTime: number;
 }) {
 	const videoRefs = useRef<(HTMLVideoElement | null)[]>([]);
-	const [tiles, setTiles] = useState<
-		Array<{ x: number; y: number; width: number; height: number }>
-	>([]);
+	const containerRef = useRef<HTMLDivElement | null>(null);
+	const [containerSize, setContainerSize] = useState<{ width: number; height: number }>({
+		width: 0,
+		height: 0,
+	});
 
 	useEffect(() => {
-		setTiles((prev) => {
-			const next = paths.map((_path, idx) => {
-				if (prev[idx]) return prev[idx];
-				return {
-					x: 16,
-					y: 16 + idx * 100,
-					width: 160,
-					height: 90,
-				};
-			});
-			return next;
-		});
-	}, [paths]);
+		const el = containerRef.current;
+		if (!el) return;
+		const update = () => {
+			setContainerSize({ width: el.clientWidth, height: el.clientHeight });
+		};
+		update();
+		const observer = new ResizeObserver(update);
+		observer.observe(el);
+		return () => observer.disconnect();
+	}, []);
 
 	useEffect(() => {
 		for (const video of videoRefs.current) {
@@ -2179,38 +2217,78 @@ function MultiLayerOverlay({
 
 	if (paths.length === 0) return null;
 
+	const transformByLayerId = new Map(transforms.map((t) => [t.layerId, t]));
+	const stageWidth = containerSize.width;
+	const stageHeight = containerSize.height;
+	const haveStage = stageWidth > 0 && stageHeight > 0;
+
 	return (
-		<div className="absolute inset-0" style={{ zIndex: 30 }}>
+		<div ref={containerRef} className="absolute inset-0" style={{ zIndex: 30 }}>
 			{paths.map((path, idx) => {
-				const tile = tiles[idx];
-				if (!tile) return null;
+				const layerId = layerIds[idx];
+				const transform = layerId ? transformByLayerId.get(layerId) : undefined;
+				// Until the container has been measured at least once we cannot
+				// translate normalized transforms into pixels — skip rendering
+				// rather than flash a wrong-size tile.
+				if (!haveStage) return null;
+
+				const fallbackWidthPx = 160;
+				const fallbackHeightPx = 90;
+				const widthPx = transform
+					? Math.max(60, transform.size.width * stageWidth)
+					: fallbackWidthPx;
+				const heightPx = transform
+					? Math.max(40, transform.size.height * stageHeight)
+					: fallbackHeightPx;
+				const xPx = transform ? transform.position.cx * stageWidth - widthPx / 2 : 16;
+				const yPx = transform ? transform.position.cy * stageHeight - heightPx / 2 : 16 + idx * 100;
+
+				const canEdit = Boolean(transform && layerId && onUpdate);
+
 				return (
 					<Rnd
 						key={`${path}-${idx}`}
-						size={{ width: tile.width, height: tile.height }}
-						position={{ x: tile.x, y: tile.y }}
+						size={{ width: widthPx, height: heightPx }}
+						position={{ x: xPx, y: yPx }}
 						bounds="parent"
 						lockAspectRatio={16 / 9}
 						minWidth={120}
 						minHeight={68}
-						onDragStop={(_e, d) => {
-							setTiles((prev) => {
-								const next = [...prev];
-								next[idx] = { ...next[idx], x: d.x, y: d.y };
-								return next;
+						disableDragging={!canEdit}
+						enableResizing={canEdit}
+						onDrag={(_e, d) => {
+							if (!layerId || !onUpdate) return;
+							const cx = (d.x + widthPx / 2) / stageWidth;
+							const cy = (d.y + heightPx / 2) / stageHeight;
+							onUpdate(layerId, {
+								position: {
+									cx: Math.max(0, Math.min(1, cx)),
+									cy: Math.max(0, Math.min(1, cy)),
+								},
 							});
 						}}
-						onResizeStop={(_e, _dir, ref, _delta, position) => {
-							setTiles((prev) => {
-								const next = [...prev];
-								next[idx] = {
-									x: position.x,
-									y: position.y,
-									width: ref.offsetWidth,
-									height: ref.offsetHeight,
-								};
-								return next;
+						onDragStop={() => {
+							onCommit?.();
+						}}
+						onResize={(_e, _dir, ref, _delta, position) => {
+							if (!layerId || !onUpdate) return;
+							const w = ref.offsetWidth;
+							const h = ref.offsetHeight;
+							const cx = (position.x + w / 2) / stageWidth;
+							const cy = (position.y + h / 2) / stageHeight;
+							onUpdate(layerId, {
+								position: {
+									cx: Math.max(0, Math.min(1, cx)),
+									cy: Math.max(0, Math.min(1, cy)),
+								},
+								size: {
+									width: Math.max(0.05, Math.min(1, w / stageWidth)),
+									height: Math.max(0.05, Math.min(1, h / stageHeight)),
+								},
 							});
+						}}
+						onResizeStop={() => {
+							onCommit?.();
 						}}
 						style={{
 							border: "1px solid rgba(255,255,255,0.3)",

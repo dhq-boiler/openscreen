@@ -4,6 +4,7 @@ import {
 	DEFAULT_EDITOR_LAYOUT_SETTINGS,
 	DEFAULT_WEBCAM_SETTINGS,
 } from "@/components/video-editor/editorDefaults";
+import type { LayerTransform } from "@/components/video-editor/projectPersistence";
 import type {
 	AnnotationRegion,
 	CropRegion,
@@ -37,6 +38,7 @@ export interface EditorState {
 	webcamMaskShape: WebcamMaskShape;
 	webcamSizePreset: WebcamSizePreset;
 	webcamPosition: WebcamPosition | null;
+	layerTransforms: LayerTransform[];
 }
 
 export const INITIAL_EDITOR_STATE: EditorState = {
@@ -56,6 +58,7 @@ export const INITIAL_EDITOR_STATE: EditorState = {
 	webcamMaskShape: DEFAULT_WEBCAM_SETTINGS.maskShape,
 	webcamSizePreset: DEFAULT_WEBCAM_SETTINGS.sizePreset,
 	webcamPosition: DEFAULT_WEBCAM_SETTINGS.position,
+	layerTransforms: [],
 };
 
 type StateUpdate = Partial<EditorState> | ((prev: EditorState) => Partial<EditorState>);

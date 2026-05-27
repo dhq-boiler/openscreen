@@ -59,9 +59,11 @@ import PlaybackControls from "./PlaybackControls";
 import {
 	createProjectData,
 	createProjectSnapshot,
+	defaultLayerTransformsForMedia,
 	deriveNextId,
 	fromFileUrl,
 	hasProjectUnsavedChanges,
+	type LayerTransform,
 	normalizeProjectEditor,
 	resolveProjectMedia,
 	resolveProjectMediaV3,
@@ -178,6 +180,7 @@ export default function VideoEditor() {
 		webcamMaskShape,
 		webcamSizePreset,
 		webcamPosition,
+		layerTransforms,
 	} = editorState;
 
 	// ── Non-undoable state
@@ -187,6 +190,9 @@ export default function VideoEditor() {
 	// `src`. The primary layer continues to flow through `videoPath` so the
 	// rest of the editor (zoom/cursor/etc.) keeps treating it as canonical.
 	const [additionalLayerPaths, setAdditionalLayerPaths] = useState<string[]>([]);
+	// Phase 4.5: layer ids matched 1:1 with additionalLayerPaths. Required so
+	// MultiLayerOverlay can resolve which LayerTransform belongs to each tile.
+	const [additionalLayerIds, setAdditionalLayerIds] = useState<string[]>([]);
 	const [videoSourcePath, setVideoSourcePath] = useState<string | null>(null);
 	const [webcamVideoPath, setWebcamVideoPath] = useState<string | null>(null);
 	const [webcamVideoSourcePath, setWebcamVideoSourcePath] = useState<string | null>(null);
@@ -341,8 +347,22 @@ export default function VideoEditor() {
 				projectMediaV3 && projectMediaV3.layers.length > 1
 					? projectMediaV3.layers.slice(1).map((layer) => toFileUrl(layer.screenVideoPath))
 					: [];
+			const extraLayerIds =
+				projectMediaV3 && projectMediaV3.layers.length > 1
+					? projectMediaV3.layers.slice(1).map((layer) => layer.id)
+					: [];
 			setAdditionalLayerPaths(extraLayerPaths);
+			setAdditionalLayerIds(extraLayerIds);
 			const normalizedEditor = normalizeProjectEditor(project.editor);
+			// Phase 4.5: synthesize default transforms when v3 media has no
+			// persisted layerTransforms yet. Keeps the editor authoritative
+			// even on first open of a freshly recorded multi-source session.
+			const resolvedLayerTransforms: LayerTransform[] =
+				normalizedEditor.layerTransforms && normalizedEditor.layerTransforms.length > 0
+					? normalizedEditor.layerTransforms
+					: projectMediaV3
+						? defaultLayerTransformsForMedia(projectMediaV3)
+						: [];
 			const inferredDurationMs = Math.max(
 				0,
 				...normalizedEditor.zoomRegions.map((region) => region.endMs),
@@ -385,6 +405,7 @@ export default function VideoEditor() {
 				webcamMaskShape: normalizedEditor.webcamMaskShape,
 				webcamSizePreset: normalizedEditor.webcamSizePreset,
 				webcamPosition: normalizedEditor.webcamPosition,
+				layerTransforms: resolvedLayerTransforms,
 			});
 			setExportQuality(normalizedEditor.exportQuality);
 			setExportFormat(normalizedEditor.exportFormat);
@@ -460,6 +481,7 @@ export default function VideoEditor() {
 			gifFrameRate,
 			gifLoop,
 			gifSizePreset,
+			layerTransforms,
 		});
 	}, [
 		currentProjectMedia,
@@ -483,6 +505,7 @@ export default function VideoEditor() {
 		gifFrameRate,
 		gifLoop,
 		gifSizePreset,
+		layerTransforms,
 	]);
 
 	const hasUnsavedChanges = hasProjectUnsavedChanges(currentProjectSnapshot, lastSavedSnapshot);
@@ -951,6 +974,21 @@ export default function VideoEditor() {
 			}));
 		},
 		[pushState],
+	);
+
+	// Phase 4.5: live drag/resize of a multi-layer tile streams partial
+	// LayerTransform updates through updateState so they enter useEditorHistory
+	// as a single checkpoint on first change; the drag/resize gesture commits
+	// via commitState on pointer-up, matching the zoom-focus pattern below.
+	const handleLayerTransformUpdate = useCallback(
+		(layerId: string, partial: Partial<LayerTransform>) => {
+			updateState((prev) => ({
+				layerTransforms: prev.layerTransforms.map((transform) =>
+					transform.layerId === layerId ? { ...transform, ...partial } : transform,
+				),
+			}));
+		},
+		[updateState],
 	);
 
 	// Focus drag: updateState for live preview, commitState on pointer-up
@@ -2175,6 +2213,10 @@ export default function VideoEditor() {
 												ref={videoPlaybackRef}
 												videoPath={videoPath || ""}
 												additionalLayerPaths={additionalLayerPaths}
+												additionalLayerIds={additionalLayerIds}
+												layerTransforms={layerTransforms}
+												onLayerTransformUpdate={handleLayerTransformUpdate}
+												onLayerTransformCommit={commitState}
 												webcamVideoPath={webcamVideoPath || undefined}
 												webcamLayoutPreset={webcamLayoutPreset}
 												webcamMaskShape={webcamMaskShape}
