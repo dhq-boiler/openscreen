@@ -20,6 +20,9 @@ function findVcVarsAll() {
 
 	const roots = [
 		process.env.VSINSTALLDIR,
+		"C:\\Program Files\\Microsoft Visual Studio\\18\\Community",
+		"C:\\Program Files\\Microsoft Visual Studio\\18\\Professional",
+		"C:\\Program Files\\Microsoft Visual Studio\\18\\Enterprise",
 		"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community",
 		"C:\\Program Files\\Microsoft Visual Studio\\2022\\Professional",
 		"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise",
