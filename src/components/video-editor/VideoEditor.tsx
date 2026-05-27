@@ -1732,6 +1732,71 @@ export default function VideoEditor() {
 						aspectRatioValue,
 					});
 
+					// Phase 3 multi-layer export branch: when extra layers are
+					// present we route through the simpler grid compositor.
+					// Editor effects (zoom/cursor/annotations/wallpaper) are
+					// not applied here — that integration is Phase 6.
+					if (additionalLayerPaths.length > 0 && videoSourcePath) {
+						const primaryLayer = {
+							id: "layer-primary",
+							kind: "screen" as const,
+							screenVideoPath: videoSourcePath,
+						};
+						const extraLayers = additionalLayerPaths.map((p, i) => ({
+							id: `layer-${i + 1}`,
+							kind: "screen" as const,
+							screenVideoPath: fromFileUrl(p),
+						}));
+						const multiMedia: import("@/lib/recordingSession").ProjectMediaV3 = {
+							schemaVersion: 3,
+							sessionId: `export-${Date.now()}`,
+							layers: [primaryLayer, ...extraLayers],
+						};
+						const multi = await import("@/lib/exporter/multiLayerExporter");
+						const multiResult = await multi.exportMultiLayer({
+							media: multiMedia,
+							settings: {
+								width: exportWidth,
+								height: exportHeight,
+								fps: 60,
+							},
+							onProgress: ({ currentSeconds, totalSeconds }) => {
+								if (totalSeconds > 0) {
+									setExportProgress({
+										currentFrame: Math.floor(currentSeconds * 60),
+										totalFrames: Math.max(1, Math.floor(totalSeconds * 60)),
+										percentage: Math.round((currentSeconds / totalSeconds) * 100),
+										estimatedTimeRemaining: Math.max(0, totalSeconds - currentSeconds),
+									});
+								}
+							},
+						});
+						if (multiResult.success && multiResult.blob) {
+							const arrayBuffer = await multiResult.blob.arrayBuffer();
+							const saveResult = await window.electronAPI.writeExportToPath(
+								arrayBuffer,
+								targetPath,
+							);
+							if (saveResult.success && saveResult.path) {
+								setUnsavedExport(null);
+								handleExportSaved("Video", saveResult.path);
+							} else {
+								setUnsavedExport({
+									arrayBuffer,
+									fileName: targetFileName,
+									format: "mp4",
+								});
+							}
+						} else {
+							const errMsg = multiResult.error ?? "Multi-layer export failed for unknown reason.";
+							setExportError(errMsg);
+							toast.error(errMsg);
+						}
+						setIsExporting(false);
+						setExportProgress(null);
+						return;
+					}
+
 					const exporter = new VideoExporter({
 						videoUrl: videoPath,
 						webcamVideoUrl: webcamVideoPath || undefined,
