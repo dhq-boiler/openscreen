@@ -24,9 +24,11 @@ import {
 	normalizeProjectMedia,
 	normalizeRecordingSession,
 	type ProjectMedia,
+	type ProjectMediaV3,
 	type RecordedVideoAssetInput,
 	type RecordingSession,
 	type StoreRecordedSessionInput,
+	toProjectMediaV3,
 } from "../../src/lib/recordingSession";
 import type {
 	CursorRecordingData,
@@ -327,6 +329,15 @@ type AttachNativeMacWebcamRecordingInput = {
 let selectedSource: SelectedSource | null = null;
 let selectedDesktopSource: DesktopCapturerSource | null = null;
 let lastEnumeratedSources = new Map<string, DesktopCapturerSource>();
+
+/**
+ * Multi-source selection state for Phase 2+ multi-window recording. When
+ * the SourceSelector picks N>1 sources, they all land here. The legacy
+ * `selectedSource` global continues to mirror `selectedSources[0]` so the
+ * existing single-source path keeps working without changes.
+ */
+let selectedSources: SelectedSource[] = [];
+let selectedDesktopSources: Array<DesktopCapturerSource | null> = [];
 let currentProjectPath: string | null = null;
 let currentRecordingSession: RecordingSession | null = null;
 
@@ -1360,6 +1371,7 @@ export function registerIpcHandlers(
 
 	ipcMain.handle("select-source", async (_, source: SelectedSource) => {
 		selectedSource = source;
+		selectedSources = [source];
 		// Reuse the exact source object returned during enumeration to avoid
 		// Windows window-source id mismatches across separate getSources() calls.
 		selectedDesktopSource =
@@ -1378,6 +1390,7 @@ export function registerIpcHandlers(
 				selectedDesktopSource = null;
 			}
 		}
+		selectedDesktopSources = [selectedDesktopSource];
 		const sourceSelectorWin = getSourceSelectorWindow();
 		if (sourceSelectorWin) {
 			sourceSelectorWin.close();
@@ -1387,6 +1400,95 @@ export function registerIpcHandlers(
 
 	ipcMain.handle("get-selected-source", () => {
 		return selectedSource;
+	});
+
+	ipcMain.handle("select-sources", async (_, sources: SelectedSource[]) => {
+		if (!Array.isArray(sources) || sources.length === 0) {
+			selectedSources = [];
+			selectedDesktopSources = [];
+			return [];
+		}
+
+		selectedSources = sources;
+		// Mirror selectedSource on the first entry so legacy single-source code
+		// (which still reads `selectedSource` directly) keeps working.
+		selectedSource = sources[0] ?? null;
+
+		// Resolve cached DesktopCapturerSource for each id, re-enumerating if
+		// the cache miss is real.
+		const needsRefresh = sources.some(
+			(s) => typeof s.id !== "string" || !lastEnumeratedSources.has(s.id),
+		);
+		if (needsRefresh) {
+			try {
+				const all = await desktopCapturer.getSources({
+					types: ["screen", "window"],
+					thumbnailSize: { width: 0, height: 0 },
+					fetchWindowIcons: true,
+				});
+				lastEnumeratedSources = new Map(all.map((c) => [c.id, c]));
+			} catch {
+				// Ignore — selectedDesktopSources entries may stay null.
+			}
+		}
+		selectedDesktopSources = sources.map((s) =>
+			typeof s.id === "string" ? (lastEnumeratedSources.get(s.id) ?? null) : null,
+		);
+		selectedDesktopSource = selectedDesktopSources[0] ?? null;
+
+		const sourceSelectorWin = getSourceSelectorWindow();
+		if (sourceSelectorWin) {
+			sourceSelectorWin.close();
+		}
+		return selectedSources;
+	});
+
+	ipcMain.handle("get-selected-sources", () => {
+		return selectedSources;
+	});
+
+	ipcMain.handle("write-multi-source-session-manifest", async (_, mediaInput: unknown) => {
+		const media = toProjectMediaV3(mediaInput);
+		if (!media) {
+			return { success: false, error: "Invalid ProjectMediaV3 payload." };
+		}
+		const primary = media.layers[0];
+		if (!primary) {
+			return { success: false, error: "No layers in payload." };
+		}
+
+		// Approve every path so subsequent reads (load project, decode for
+		// editor preview, etc.) can access them.
+		for (const layer of media.layers) {
+			approveFilePath(layer.screenVideoPath);
+		}
+		if (media.webcam) {
+			approveFilePath(media.webcam.webcamVideoPath);
+		}
+
+		const manifestPath = path.join(
+			RECORDINGS_DIR,
+			`${path.parse(primary.screenVideoPath).name}${RECORDING_SESSION_SUFFIX}`,
+		);
+		const manifest: ProjectMediaV3 & { createdAt: number } = {
+			...media,
+			createdAt: Date.now(),
+		};
+		await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf-8");
+
+		// Also reflect the primary layer into the legacy single-source
+		// "currentRecordingSession" so existing reads (editor open-on-finish,
+		// etc.) keep working.
+		const legacySession: RecordingSession = {
+			screenVideoPath: primary.screenVideoPath,
+			createdAt: manifest.createdAt,
+			...(media.webcam ? { webcamVideoPath: media.webcam.webcamVideoPath } : {}),
+			...(media.cursorCaptureMode ? { cursorCaptureMode: media.cursorCaptureMode } : {}),
+		};
+		setCurrentRecordingSessionState(legacySession);
+		currentProjectPath = null;
+
+		return { success: true, manifestPath, primaryScreenVideoPath: primary.screenVideoPath };
 	});
 
 	ipcMain.handle("request-camera-access", async () => {

@@ -13,11 +13,18 @@ interface DesktopSource {
 	appIcon: string | null;
 }
 
+/**
+ * Maximum number of sources the user can pick at once. Above 4 the layout
+ * gets messy in the editor and the GPU cost starts to bite. The native
+ * helper itself has no hard limit — this is a UX cap.
+ */
+const MAX_MULTI_SELECTION = 4;
+
 export function SourceSelector() {
 	const t = useScopedT("launch");
 	const tc = useScopedT("common");
 	const [sources, setSources] = useState<DesktopSource[]>([]);
-	const [selectedSource, setSelectedSource] = useState<DesktopSource | null>(null);
+	const [selectedSourceIds, setSelectedSourceIds] = useState<string[]>([]);
 	const [loading, setLoading] = useState(true);
 
 	useEffect(() => {
@@ -52,10 +59,33 @@ export function SourceSelector() {
 
 	const screenSources = sources.filter((s) => s.id.startsWith("screen:"));
 	const windowSources = sources.filter((s) => s.id.startsWith("window:"));
+	const sourcesById = new Map(sources.map((s) => [s.id, s]));
+	const selectedSources = selectedSourceIds
+		.map((id) => sourcesById.get(id))
+		.filter((s): s is DesktopSource => Boolean(s));
 
-	const handleSourceSelect = (source: DesktopSource) => setSelectedSource(source);
+	const toggleSource = (source: DesktopSource) => {
+		setSelectedSourceIds((prev) => {
+			if (prev.includes(source.id)) {
+				return prev.filter((id) => id !== source.id);
+			}
+			if (prev.length >= MAX_MULTI_SELECTION) {
+				// Replace the oldest selection so the cap stays at MAX.
+				return [...prev.slice(1), source.id];
+			}
+			return [...prev, source.id];
+		});
+	};
+
 	const handleShare = async () => {
-		if (selectedSource) await window.electronAPI.selectSource(selectedSource);
+		if (selectedSources.length === 0) return;
+		if (selectedSources.length === 1) {
+			// Preserve the legacy single-source IPC path so existing recording
+			// state machine in the main app keeps working unchanged.
+			await window.electronAPI.selectSource(selectedSources[0]);
+			return;
+		}
+		await window.electronAPI.selectSources(selectedSources);
 	};
 
 	if (loading) {
@@ -73,12 +103,13 @@ export function SourceSelector() {
 	}
 
 	const renderSourceCard = (source: DesktopSource) => {
-		const isSelected = selectedSource?.id === source.id;
+		const selectionIndex = selectedSourceIds.indexOf(source.id);
+		const isSelected = selectionIndex !== -1;
 		return (
 			<div
 				key={source.id}
 				className={`${styles.sourceCard} ${isSelected ? styles.selected : ""} p-1.5`}
-				onClick={() => handleSourceSelect(source)}
+				onClick={() => toggleSource(source)}
 			>
 				<div className="relative mb-1.5 overflow-hidden rounded-lg border border-white/[0.06] bg-black/30">
 					<img
@@ -89,7 +120,13 @@ export function SourceSelector() {
 					{isSelected && (
 						<div className="absolute right-1.5 top-1.5">
 							<div className={styles.checkBadge}>
-								<MdCheck size={11} className="text-white" />
+								{selectedSources.length > 1 ? (
+									<span className="text-[10px] font-semibold text-white px-1">
+										{selectionIndex + 1}
+									</span>
+								) : (
+									<MdCheck size={11} className="text-white" />
+								)}
 							</div>
 						</div>
 					)}
@@ -103,6 +140,11 @@ export function SourceSelector() {
 			</div>
 		);
 	};
+
+	const selectionHint =
+		selectedSources.length > 1
+			? `${selectedSources.length} sources selected — they will be recorded in parallel.`
+			: null;
 
 	return (
 		<div className={`min-h-screen flex flex-col ${styles.glassContainer}`}>
@@ -143,6 +185,9 @@ export function SourceSelector() {
 					</div>
 				</Tabs>
 			</div>
+			{selectionHint ? (
+				<div className="px-3 pb-1 text-center text-[10px] text-zinc-400">{selectionHint}</div>
+			) : null}
 			<div className="flex justify-center gap-2 border-t border-white/[0.06] p-3">
 				<Button
 					data-testid="source-selector-cancel-button"
@@ -155,7 +200,7 @@ export function SourceSelector() {
 				<Button
 					data-testid="source-selector-share-button"
 					onClick={handleShare}
-					disabled={!selectedSource}
+					disabled={selectedSources.length === 0}
 					className="h-8 rounded-lg bg-[#34B27B] px-5 text-[11px] font-semibold text-white transition-transform duration-150 hover:bg-[#34B27B]/85 active:scale-95 disabled:bg-zinc-700 disabled:opacity-30"
 				>
 					{tc("actions.share")}

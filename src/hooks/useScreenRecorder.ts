@@ -3,6 +3,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useScopedT } from "@/contexts/I18nContext";
 import {
+	type MultiSourceRecordingHandle,
+	type MultiSourceTarget,
+	newLayerId,
+	newRecordingId,
+	newSessionId,
+	startMultiSourceRecording,
+} from "@/lib/multiSourceRecording";
+import {
 	type NativeMacRecordingRequest,
 	parseMacDisplayIdFromSourceId,
 	parseMacWindowIdFromSourceId,
@@ -131,6 +139,11 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	const webcamRecorder = useRef<RecorderHandle | null>(null);
 	const nativeWindowsRecording = useRef<NativeWindowsRecordingHandle | null>(null);
 	const nativeMacRecording = useRef<NativeMacRecordingHandle | null>(null);
+	// Phase 2-D: parallel multi-source recording session, populated when the
+	// user picked 2..N sources from the SourceSelector. When non-null, the
+	// stop/pause/resume paths route through the orchestrator instead of the
+	// per-session refs above.
+	const multiSourceRecording = useRef<MultiSourceRecordingHandle | null>(null);
 	const stream = useRef<MediaStream | null>(null);
 	const screenStream = useRef<MediaStream | null>(null);
 	const microphoneStream = useRef<MediaStream | null>(null);
@@ -150,7 +163,8 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	const canPauseRecording =
 		recording &&
 		Boolean(
-			(nativeWindowsRecording.current && !nativeWindowsRecording.current.finalizing) ||
+			multiSourceRecording.current ||
+				(nativeWindowsRecording.current && !nativeWindowsRecording.current.finalizing) ||
 				(nativeMacRecording.current && !nativeMacRecording.current.finalizing) ||
 				(screenRecorder.current && screenRecorder.current.recorder.state !== "inactive"),
 		);
@@ -619,6 +633,10 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	);
 
 	const stopRecording = useRef(() => {
+		if (multiSourceRecording.current) {
+			void finalizeMultiSourceRecording(false);
+			return;
+		}
 		if (nativeWindowsRecording.current) {
 			void finalizeNativeWindowsRecording(false);
 			return;
@@ -776,6 +794,225 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				resolve();
 			}, 5000);
 		});
+	};
+
+	const finalizeMultiSourceRecording = useCallback(
+		async (discard = false) => {
+			const handle = multiSourceRecording.current;
+			if (!handle) return false;
+			multiSourceRecording.current = null;
+
+			try {
+				const media = await handle.stopAll({ discard });
+				if (discard) {
+					setRecording(false);
+					setPaused(false);
+					setElapsedSeconds(0);
+					accumulatedDurationMs.current = 0;
+					segmentStartedAt.current = null;
+					teardownMedia();
+					return true;
+				}
+
+				const writeResult = await window.electronAPI.writeMultiSourceSessionManifest(media);
+				if (!writeResult.success) {
+					console.error("Failed to write multi-source session manifest:", writeResult.error);
+					toast.error("Failed to save multi-window recording session.");
+				}
+
+				setRecording(false);
+				setPaused(false);
+				setElapsedSeconds(0);
+				accumulatedDurationMs.current = 0;
+				segmentStartedAt.current = null;
+				teardownMedia();
+				await window.electronAPI.switchToEditor();
+				return true;
+			} catch (error) {
+				console.error("Multi-source finalize failed:", error);
+				toast.error(
+					`Multi-window recording failed to stop: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+				setRecording(false);
+				setPaused(false);
+				setElapsedSeconds(0);
+				accumulatedDurationMs.current = 0;
+				segmentStartedAt.current = null;
+				teardownMedia();
+				return true;
+			}
+		},
+		[teardownMedia],
+	);
+
+	/**
+	 * Multi-source entrypoint. Called from startRecording when the user
+	 * picked 2..N sources. Builds N native recording requests, spawns them
+	 * via the orchestrator, and stores the handle so stop/pause/resume can
+	 * fan out across all layers. Returns true if it handled the session.
+	 */
+	const startMultiSourceIfMultiSelected = async (
+		selectedSources: ProcessedDesktopSource[],
+		countdownRunToken?: number,
+	): Promise<boolean> => {
+		if (selectedSources.length < 2) return false;
+
+		const platform = await window.electronAPI.getPlatform();
+		if (platform !== "win32" && platform !== "darwin") return false;
+
+		// We currently require native helpers for multi-source. Browser
+		// MediaRecorder is single-source per getDisplayMedia call and
+		// composing N getDisplayMedia streams in the renderer is a Phase 6
+		// optimization, not a Phase 2 requirement.
+		if (platform === "win32") {
+			const availability = await window.electronAPI.isNativeWindowsCaptureAvailable();
+			if (!availability.success || !availability.available) {
+				toast.error("Multi-window recording requires the native Windows capture helper.");
+				return false;
+			}
+		} else {
+			const availability = await window.electronAPI.isNativeMacCaptureAvailable();
+			if (!availability.success || !availability.available) {
+				toast.error("Multi-window recording requires the native macOS capture helper.");
+				return false;
+			}
+		}
+
+		if (!isCountdownRunActive(countdownRunToken)) return true;
+
+		const sessionId = newSessionId();
+		const baseRecordingId = newRecordingId();
+		const targets: MultiSourceTarget[] = selectedSources.map((source, index) => {
+			const layerId = newLayerId();
+			const recordingId = baseRecordingId + index;
+			const sourceLabel = source.name;
+
+			if (platform === "win32") {
+				const displayId = Number(source.display_id);
+				const sourceType = source.id.startsWith("window:") ? "window" : "display";
+				const windowHandle = parseWindowHandleFromSourceId(source.id);
+				const request: NativeWindowsRecordingRequest = {
+					recordingId,
+					source: {
+						type: sourceType,
+						sourceId: source.id,
+						...(Number.isFinite(displayId) ? { displayId } : {}),
+						...(windowHandle ? { windowHandle } : {}),
+					},
+					video: {
+						fps: TARGET_FRAME_RATE,
+						width: TARGET_WIDTH,
+						height: TARGET_HEIGHT,
+					},
+					// Phase 2 cap: only the first source captures audio + cursor;
+					// the rest are video-only so we don't get N× audio mixing
+					// or N× cursor sampler conflicts. Phase 6 hoists audio into
+					// a single shared track and per-layer cursor capture.
+					audio: {
+						system: { enabled: index === 0 && systemAudioEnabled },
+						microphone: {
+							enabled: index === 0 && microphoneEnabled,
+							deviceId: microphoneDeviceId,
+							deviceName: microphoneDeviceName,
+							gain: MIC_GAIN_BOOST,
+						},
+					},
+					webcam: {
+						enabled: index === 0 && webcamEnabled,
+						deviceId: webcamDeviceId,
+						deviceName: webcamDeviceName,
+						width: 0,
+						height: 0,
+						fps: WEBCAM_TARGET_FRAME_RATE,
+					},
+					cursor: { mode: index === 0 ? cursorCaptureMode : "system" },
+				};
+				return {
+					platform: "win32",
+					layerId,
+					recordingId,
+					sourceLabel,
+					request,
+				};
+			}
+
+			// macOS
+			const displayId = parseMacDisplayIdFromSourceId(source.id);
+			const windowId = parseMacWindowIdFromSourceId(source.id);
+			const sourceType = source.id.startsWith("window:") ? "window" : "display";
+			// outputs.screenPath is required by the helper but the main
+			// process re-derives it from recordingId, so any unique path is
+			// fine — we let the main-process handler set the canonical one.
+			const cursorMode: CursorCaptureMode = index === 0 ? cursorCaptureMode : "system";
+			const request: NativeMacRecordingRequest = {
+				schemaVersion: 1,
+				recordingId,
+				source: {
+					type: sourceType,
+					sourceId: source.id,
+					...(displayId !== null ? { displayId } : {}),
+					...(windowId !== null ? { windowId } : {}),
+				},
+				video: {
+					fps: TARGET_FRAME_RATE,
+					width: TARGET_WIDTH,
+					height: TARGET_HEIGHT,
+					hideSystemCursor: cursorMode === "editable-overlay",
+				},
+				audio: {
+					system: { enabled: index === 0 && systemAudioEnabled },
+					microphone: {
+						enabled: index === 0 && microphoneEnabled,
+						deviceId: microphoneDeviceId,
+						deviceName: microphoneDeviceName,
+						gain: MIC_GAIN_BOOST,
+					},
+				},
+				webcam: {
+					enabled: index === 0 && webcamEnabled,
+					deviceId: webcamDeviceId,
+					deviceName: webcamDeviceName,
+					width: 0,
+					height: 0,
+					fps: WEBCAM_TARGET_FRAME_RATE,
+				},
+				cursor: { mode: cursorMode },
+				outputs: {
+					screenPath: `recording-${recordingId}.mp4`,
+				},
+			};
+			return {
+				platform: "darwin",
+				layerId,
+				recordingId,
+				sourceLabel,
+				request,
+			};
+		});
+
+		try {
+			const handle = await startMultiSourceRecording(targets, { sessionId });
+			multiSourceRecording.current = handle;
+
+			setRecording(true);
+			setPaused(false);
+			recordingId.current = baseRecordingId;
+			accumulatedDurationMs.current = 0;
+			segmentStartedAt.current = Date.now();
+			setElapsedSeconds(0);
+			allowAutoFinalize.current = true;
+			return true;
+		} catch (error) {
+			console.error("Failed to start multi-source recording:", error);
+			toast.error(
+				`Multi-window recording failed to start: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+			return true; // we handled it (with failure) — do not fall back to single-source
+		}
 	};
 
 	const startNativeWindowsRecordingIfAvailable = async (
@@ -1131,6 +1368,16 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 
 	const startRecording = async (countdownRunToken?: number) => {
 		try {
+			// Phase 2-D: prefer multi-source path when the user picked 2..N
+			// sources. Falls back to the single-source flow when the user
+			// only picked one (or the API returns an empty list).
+			const selectedSources = await window.electronAPI.getSelectedSources();
+			if (selectedSources.length > 1) {
+				if (await startMultiSourceIfMultiSelected(selectedSources, countdownRunToken)) {
+					return;
+				}
+			}
+
 			const selectedSource = await window.electronAPI.getSelectedSource();
 			if (!selectedSource) {
 				alert(t("recording.selectSource"));
@@ -1405,6 +1652,30 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	};
 
 	const togglePaused = () => {
+		const activeMultiSource = multiSourceRecording.current;
+		if (activeMultiSource) {
+			void (async () => {
+				try {
+					if (paused) {
+						await activeMultiSource.resumeAll();
+						segmentStartedAt.current = Date.now();
+						setPaused(false);
+						return;
+					}
+					const pausedAtMs = getRecordingDurationMs();
+					await activeMultiSource.pauseAll();
+					accumulatedDurationMs.current = pausedAtMs;
+					segmentStartedAt.current = null;
+					setElapsedSeconds(Math.floor(accumulatedDurationMs.current / 1000));
+					setPaused(true);
+				} catch (error) {
+					console.error("Failed to toggle multi-source pause:", error);
+					toast.error(error instanceof Error ? error.message : "Failed to toggle pause state");
+				}
+			})();
+			return;
+		}
+
 		const activeNativeWindowsRecording = nativeWindowsRecording.current;
 		if (activeNativeWindowsRecording && !activeNativeWindowsRecording.finalizing) {
 			void (async () => {

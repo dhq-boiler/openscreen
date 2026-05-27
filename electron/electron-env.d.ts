@@ -42,7 +42,17 @@ interface Window {
 			};
 		}>;
 		selectSource: (source: ProcessedDesktopSource) => Promise<ProcessedDesktopSource | null>;
+		selectSources: (sources: ProcessedDesktopSource[]) => Promise<ProcessedDesktopSource[]>;
 		getSelectedSource: () => Promise<ProcessedDesktopSource | null>;
+		getSelectedSources: () => Promise<ProcessedDesktopSource[]>;
+		writeMultiSourceSessionManifest: (
+			media: import("../src/lib/recordingSession").ProjectMediaV3,
+		) => Promise<{
+			success: boolean;
+			manifestPath?: string;
+			primaryScreenVideoPath?: string;
+			error?: string;
+		}>;
 		requestCameraAccess: () => Promise<{
 			success: boolean;
 			granted: boolean;

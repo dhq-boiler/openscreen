@@ -46,8 +46,19 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	selectSource: (source: ProcessedDesktopSource) => {
 		return ipcRenderer.invoke("select-source", source);
 	},
+	selectSources: (sources: ProcessedDesktopSource[]) => {
+		return ipcRenderer.invoke("select-sources", sources);
+	},
 	getSelectedSource: () => {
 		return ipcRenderer.invoke("get-selected-source");
+	},
+	getSelectedSources: () => {
+		return ipcRenderer.invoke("get-selected-sources");
+	},
+	writeMultiSourceSessionManifest: (
+		media: import("../src/lib/recordingSession").ProjectMediaV3,
+	) => {
+		return ipcRenderer.invoke("write-multi-source-session-manifest", media);
 	},
 	requestCameraAccess: () => {
 		return ipcRenderer.invoke("request-camera-access");
