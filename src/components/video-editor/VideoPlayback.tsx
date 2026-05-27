@@ -2248,20 +2248,27 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 						isPlaying={isPlaying}
 						currentTime={currentTime}
 					/>
-					{/* Phase 10: annotation / blur overlay.
-				    Inside stageContentRef so it scales with the rest of the
-				    stage content during zoom. Sized to Layer 1's rect so
-				    existing annotation positions (stored as % of Layer 1)
-				    remain compatible. The focus indicator now lives in a
-				    separate wrapper outside stageContentRef. */}
+					{/* Phase 11 (stage-wide annotations): annotation / blur overlay
+				    spans the entire stage so blurs / annotations can be placed
+				    on Layer 2 / 3 (and the background) without their stored
+				    coordinates being interpreted as "outside" the Layer 1 rect.
+				    Lives inside stageContentRef so it still scales with the
+				    rest of the stage during zoom (Phase 10's content-follow
+				    semantics). NOTE: existing annotations were stored as % of
+				    Layer 1 --- they will appear at the same % of the new
+				    (stage-sized) wrapper until a position migration is added
+				    (planned as a separate follow-up). The blur sampling source
+				    is still PixiJS Layer 1 only, so blurs over Layer 2 / 3
+				    sample out of bounds --- a stage-wide compositing canvas
+				    is the next step in the follow-up. */}
 					{pixiReady && videoReady && (
 						<div
 							className="absolute select-none"
 							style={{
-								left: primaryStageXPx,
-								top: primaryStageYPx,
-								width: primaryStageWidthPx,
-								height: primaryStageHeightPx,
+								left: 0,
+								top: 0,
+								width: stagePxWidth,
+								height: stagePxHeight,
 								pointerEvents: "none",
 								zIndex: 500,
 							}}
@@ -2348,8 +2355,8 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 									<AnnotationOverlay
 										key={
 											item.kind === "blur"
-												? `${item.region.id}-${primaryStageWidthPx}-${primaryStageHeightPx}-${item.region.blurData?.type ?? "blur"}-${item.region.blurData?.shape ?? "rectangle"}-${item.region.blurData?.color ?? "white"}-${Math.round(item.region.blurData?.blockSize ?? 0)}-${Math.round(item.region.blurData?.intensity ?? 0)}-${(item.region.blurData?.freehandPoints ?? []).map((p) => `${Math.round(p.x)}_${Math.round(p.y)}`).join("-")}`
-												: `${item.region.id}-${primaryStageWidthPx}-${primaryStageHeightPx}`
+												? `${item.region.id}-${stagePxWidth}-${stagePxHeight}-${item.region.blurData?.type ?? "blur"}-${item.region.blurData?.shape ?? "rectangle"}-${item.region.blurData?.color ?? "white"}-${Math.round(item.region.blurData?.blockSize ?? 0)}-${Math.round(item.region.blurData?.intensity ?? 0)}-${(item.region.blurData?.freehandPoints ?? []).map((p) => `${Math.round(p.x)}_${Math.round(p.y)}`).join("-")}`
+												: `${item.region.id}-${stagePxWidth}-${stagePxHeight}`
 										}
 										annotation={item.region}
 										isSelected={
@@ -2357,8 +2364,8 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 												? item.region.id === selectedBlurId
 												: item.region.id === selectedAnnotationId
 										}
-										containerWidth={primaryStageWidthPx}
-										containerHeight={primaryStageHeightPx}
+										containerWidth={stagePxWidth}
+										containerHeight={stagePxHeight}
 										onPositionChange={(id, position) =>
 											item.kind === "blur"
 												? onBlurPositionChange?.(id, position)
