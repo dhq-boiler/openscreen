@@ -117,6 +117,14 @@ interface VideoPlaybackProps {
 	 */
 	additionalLayerIds?: string[];
 	/**
+	 * Phase 6.5: id of the primary layer when the project is multi-source.
+	 * When set, the editor renders the PixiJS canvas inside a draggable +
+	 * resizable Rnd that's driven by `layerTransforms[primaryLayerId]`,
+	 * matching the way additional layers behave. Null for single-source
+	 * projects, which keep their legacy full-stage central placement.
+	 */
+	primaryLayerId?: string | null;
+	/**
 	 * Phase 4.5: normalized per-layer placement (cx, cy in [0,1], size in
 	 * [0,1] relative to stage). When absent or missing entries the overlay
 	 * falls back to a default tile in the top-left.
@@ -255,6 +263,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			videoPath,
 			additionalLayerPaths = [],
 			additionalLayerIds = [],
+			primaryLayerId = null,
 			layerTransforms = [],
 			onLayerTransformUpdate,
 			onLayerTransformCommit,
@@ -338,6 +347,35 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		const cursorTelemetryRef = useRef<CursorTelemetryPoint[]>([]);
 		// Phase 5.5: per-layer rects (stage-normalized) for layer-local zoom focus.
 		const layerRectsRef = useRef<Map<string, LayerRect>>(new Map());
+		// Phase 6.5: stage size for the primary tile Rnd. ResizeObserver below
+		// keeps it in sync with the outermost wrapper so px<->normalized math
+		// stays correct when the editor preview resizes.
+		const [stageWrapperSize, setStageWrapperSize] = useState<{
+			width: number;
+			height: number;
+		}>({ width: 0, height: 0 });
+		// Phase 6.5: rendered video rect in stage px. Mirrors baseMaskRef so
+		// the React tree can react to it (the ref alone can't trigger effects).
+		// Used to one-shot-sync layerTransforms[0] with the actual painted
+		// frame so the user sees Layer 1's outline align with the video, not
+		// the padded wallpaper area.
+		const [baseMaskState, setBaseMaskState] = useState<{
+			x: number;
+			y: number;
+			width: number;
+			height: number;
+		}>({ x: 0, y: 0, width: 0, height: 0 });
+		const primaryRectSyncedRef = useRef(false);
+		// Phase 6.5: hoisted up so the layoutVideoContent useCallback below
+		// can list enablePrimaryTile in its deps without a TDZ error. Recomputed
+		// every render; cheap because it's just a find() + boolean.
+		const primaryTransform =
+			primaryLayerId != null
+				? (layerTransforms.find((t) => t.layerId === primaryLayerId) ?? null)
+				: null;
+		const enablePrimaryTile = Boolean(
+			primaryTransform && additionalLayerPaths.length > 0 && primaryLayerId,
+		);
 		const cursorClickTimestampsRef = useRef<number[]>([]);
 		const selectedZoomIdRef = useRef<string | null>(null);
 		const animationStateRef = useRef({
@@ -577,6 +615,12 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				};
 			}
 
+			// Phase 6.5: when the primary is wrapped by a Rnd that's already
+			// sized to the padded content area, do NOT apply padding again
+			// inside the PixiJS canvas — otherwise the layoutUtils paddingScale
+			// stacks (0.8 * 0.8 = 0.64) and the rendered video sits inside an
+			// extra wallpaper margin within Layer 1's outline.
+			const effectivePadding = enablePrimaryTile ? 0 : padding;
 			const result = layoutVideoContentUtil({
 				container,
 				app,
@@ -586,7 +630,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				cropRegion,
 				lockedVideoDimensions: lockedVideoDimensionsRef.current,
 				borderRadius,
-				padding,
+				padding: effectivePadding,
 				webcamDimensions,
 				webcamLayoutPreset,
 				webcamSizePreset,
@@ -600,6 +644,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				baseScaleRef.current = result.baseScale;
 				baseOffsetRef.current = result.baseOffset;
 				baseMaskRef.current = result.maskRect;
+				setBaseMaskState(result.maskRect);
 				borderRadiusRef.current = result.maskBorderRadius;
 				cropBoundsRef.current = result.cropBounds;
 				setWebcamLayout(result.webcamRect);
@@ -620,6 +665,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			cropRegion,
 			borderRadius,
 			padding,
+			enablePrimaryTile,
 			webcamDimensions,
 			webcamLayoutPreset,
 			webcamSizePreset,
@@ -816,6 +862,66 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			}
 			layerRectsRef.current = next;
 		}, [layerTransforms]);
+
+		// Phase 6.5: observe the outer wrapper so Rnd math stays accurate even
+		// when the preview gets resized by the splitter or fullscreen toggle.
+		useEffect(() => {
+			const el = outerWrapperRef.current;
+			if (!el) return;
+			const update = () => {
+				setStageWrapperSize({ width: el.clientWidth, height: el.clientHeight });
+			};
+			update();
+			const observer = new ResizeObserver(update);
+			observer.observe(el);
+			return () => observer.disconnect();
+		}, []);
+
+		// Phase 6.5: on first paint after layout, snap the primary Rnd to the
+		// actual rendered video rect (baseMask). Project files that have
+		// already been moved by the user are skipped — we detect "still at
+		// the default" by checking the symmetric width/height + centered
+		// position produced by defaultLayerTransformsForMedia. This sync runs
+		// exactly once per VideoPlayback mount.
+		useEffect(() => {
+			if (primaryRectSyncedRef.current) return;
+			if (!primaryLayerId || !onLayerTransformUpdate) return;
+			if (additionalLayerPaths.length === 0) return;
+			if (baseMaskState.width <= 0 || baseMaskState.height <= 0) return;
+			if (stageWrapperSize.width <= 0 || stageWrapperSize.height <= 0) return;
+
+			const currentPrimary = layerTransforms.find((t) => t.layerId === primaryLayerId);
+			if (!currentPrimary) return;
+
+			const isAtDefault =
+				Math.abs(currentPrimary.position.cx - 0.5) < 0.005 &&
+				Math.abs(currentPrimary.position.cy - 0.5) < 0.005 &&
+				Math.abs(currentPrimary.size.width - currentPrimary.size.height) < 0.005;
+
+			if (!isAtDefault) {
+				primaryRectSyncedRef.current = true;
+				return;
+			}
+
+			const cx = (baseMaskState.x + baseMaskState.width / 2) / stageWrapperSize.width;
+			const cy = (baseMaskState.y + baseMaskState.height / 2) / stageWrapperSize.height;
+			const width = baseMaskState.width / stageWrapperSize.width;
+			const height = baseMaskState.height / stageWrapperSize.height;
+			onLayerTransformUpdate(primaryLayerId, {
+				position: { cx, cy },
+				size: { width, height },
+			});
+			onLayerTransformCommit?.();
+			primaryRectSyncedRef.current = true;
+		}, [
+			baseMaskState,
+			stageWrapperSize,
+			primaryLayerId,
+			additionalLayerPaths.length,
+			layerTransforms,
+			onLayerTransformUpdate,
+			onLayerTransformCommit,
+		]);
 
 		useEffect(() => {
 			cursorTelemetryRef.current = cursorTelemetry;
@@ -1897,6 +2003,31 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			? { backgroundImage: `url(${resolvedWallpaper || ""})` }
 			: { background: resolvedWallpaper || "" };
 
+		// Phase 6.5: primaryTransform / enablePrimaryTile are hoisted to the
+		// top of this component (see useState block above) so the
+		// layoutVideoContent useCallback can list enablePrimaryTile as a dep
+		// without a TDZ error. Layer 1 always renders inside the Rnd so React
+		// keeps the same DOM hierarchy across single-source / multi-source
+		// toggles and PixiJS doesn't re-initialize.
+		const stagePxWidth = stageWrapperSize.width;
+		const stagePxHeight = stageWrapperSize.height;
+		const primaryStageWidthPx =
+			enablePrimaryTile && primaryTransform
+				? Math.max(60, primaryTransform.size.width * stagePxWidth)
+				: stagePxWidth;
+		const primaryStageHeightPx =
+			enablePrimaryTile && primaryTransform
+				? Math.max(40, primaryTransform.size.height * stagePxHeight)
+				: stagePxHeight;
+		const primaryStageXPx =
+			enablePrimaryTile && primaryTransform
+				? primaryTransform.position.cx * stagePxWidth - primaryStageWidthPx / 2
+				: 0;
+		const primaryStageYPx =
+			enablePrimaryTile && primaryTransform
+				? primaryTransform.position.cy * stagePxHeight - primaryStageHeightPx / 2
+				: 0;
+
 		return (
 			<div
 				ref={outerWrapperRef}
@@ -1923,226 +2054,306 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 						filter: showBlur ? "blur(2px)" : "none",
 					}}
 				/>
-				<div
-					ref={composite3DRef}
-					className="absolute inset-0"
-					style={{
-						transformStyle: "preserve-3d",
-						transformOrigin: "center center",
+				<Rnd
+					size={{ width: primaryStageWidthPx, height: primaryStageHeightPx }}
+					position={{ x: primaryStageXPx, y: primaryStageYPx }}
+					bounds="parent"
+					disableDragging={!enablePrimaryTile}
+					enableResizing={enablePrimaryTile}
+					// Phase 6.5: preserve the video's aspect ratio while
+					// resizing, matching the behavior of additional layer
+					// tiles below. The locked ratio tracks the current size,
+					// which after the baseMask sync equals the rendered
+					// frame's aspect.
+					lockAspectRatio={
+						enablePrimaryTile && primaryStageHeightPx > 0
+							? primaryStageWidthPx / primaryStageHeightPx
+							: false
+					}
+					onDrag={(_e, d) => {
+						if (!enablePrimaryTile || !primaryLayerId || !onLayerTransformUpdate) return;
+						const cx = (d.x + primaryStageWidthPx / 2) / stagePxWidth;
+						const cy = (d.y + primaryStageHeightPx / 2) / stagePxHeight;
+						onLayerTransformUpdate(primaryLayerId, {
+							position: {
+								cx: Math.max(0, Math.min(1, cx)),
+								cy: Math.max(0, Math.min(1, cy)),
+							},
+						});
 					}}
+					onDragStop={() => {
+						if (enablePrimaryTile) onLayerTransformCommit?.();
+					}}
+					onResize={(_e, _dir, ref, _delta, position) => {
+						if (!enablePrimaryTile || !primaryLayerId || !onLayerTransformUpdate) return;
+						const w = ref.offsetWidth;
+						const h = ref.offsetHeight;
+						const cx = (position.x + w / 2) / stagePxWidth;
+						const cy = (position.y + h / 2) / stagePxHeight;
+						onLayerTransformUpdate(primaryLayerId, {
+							position: {
+								cx: Math.max(0, Math.min(1, cx)),
+								cy: Math.max(0, Math.min(1, cy)),
+							},
+							size: {
+								width: Math.max(0.05, Math.min(1, w / stagePxWidth)),
+								height: Math.max(0.05, Math.min(1, h / stagePxHeight)),
+							},
+						});
+					}}
+					onResizeStop={() => {
+						if (enablePrimaryTile) onLayerTransformCommit?.();
+					}}
+					style={
+						enablePrimaryTile
+							? {
+									zIndex: 10,
+									border: "1px solid rgba(255,255,255,0.3)",
+									borderRadius: 6,
+									overflow: "hidden",
+									boxShadow: "0 4px 12px rgba(0,0,0,0.5)",
+									cursor: "move",
+								}
+							: { zIndex: 1 }
+					}
 				>
-					<div
-						ref={containerRef}
-						className="absolute inset-0"
-						style={{
-							filter:
-								showShadow && shadowIntensity > 0
-									? `drop-shadow(0 ${shadowIntensity * 12}px ${shadowIntensity * 48}px rgba(0,0,0,${shadowIntensity * 0.7})) drop-shadow(0 ${shadowIntensity * 4}px ${shadowIntensity * 16}px rgba(0,0,0,${shadowIntensity * 0.5})) drop-shadow(0 ${shadowIntensity * 2}px ${shadowIntensity * 8}px rgba(0,0,0,${shadowIntensity * 0.3}))`
-									: "none",
-						}}
-					/>
-					{webcamVideoPath &&
-						(() => {
-							const clipPath = getCssClipPath(webcamLayout?.maskShape ?? "rectangle");
-							const useClipPath = !!clipPath;
-							return (
-								<div
-									className="absolute"
-									style={{
-										left: webcamLayout?.x ?? 0,
-										top: webcamLayout?.y ?? 0,
-										width: webcamLayout?.width ?? 0,
-										height: webcamLayout?.height ?? 0,
-										zIndex: 20,
-										opacity: webcamLayout ? 1 : 0,
-										filter:
-											useClipPath && webcamCssBoxShadow !== "none"
-												? `drop-shadow(${webcamCssBoxShadow})`
-												: undefined,
-									}}
-								>
-									<video
-										ref={webcamVideoRef}
-										src={webcamVideoPath}
-										className={`w-full h-full object-cover ${webcamLayoutPreset === "picture-in-picture" ? "cursor-grab active:cursor-grabbing" : "pointer-events-none"}`}
-										style={{
-											borderRadius: useClipPath ? 0 : (webcamLayout?.borderRadius ?? 0),
-											clipPath: clipPath ?? undefined,
-											boxShadow: useClipPath ? "none" : webcamCssBoxShadow,
-											backgroundColor: "#000",
-										}}
-										onPointerDown={handleWebcamPointerDown}
-										onPointerMove={handleWebcamPointerMove}
-										onPointerUp={handleWebcamPointerUp}
-										onPointerLeave={handleWebcamPointerUp}
-										muted
-										preload="metadata"
-										playsInline
-									/>
-								</div>
-							);
-						})()}
-					{/* Only render overlay after PIXI and video are fully initialized */}
-					{pixiReady && videoReady && (
+					{enablePrimaryTile && (
 						<div
-							ref={setOverlayRefs}
-							className="absolute inset-0 select-none"
-							style={{ pointerEvents: "auto", zIndex: 30 }}
-							onPointerDown={handleOverlayPointerDown}
-							onPointerMove={handleOverlayPointerMove}
-							onPointerUp={handleOverlayPointerUp}
-							onPointerLeave={handleOverlayPointerLeave}
+							className="pointer-events-none absolute left-1 top-1 rounded bg-black/60 px-1 text-[9px] font-semibold text-white"
+							style={{ zIndex: 12 }}
 						>
-							<div
-								ref={focusIndicatorRef}
-								className="absolute rounded-md border border-[#34B27B]/80 bg-[#34B27B]/20 shadow-[0_0_0_1px_rgba(52,178,123,0.35)]"
-								style={{ display: "none", pointerEvents: "none" }}
-							/>
-							{(() => {
-								const filteredAnnotations = (annotationRegions || []).filter((annotation) => {
-									if (
-										typeof annotation.startMs !== "number" ||
-										typeof annotation.endMs !== "number"
-									)
-										return false;
-
-									if (annotation.id === selectedAnnotationId) return true;
-
-									const timeMs = Math.round(currentTime * 1000);
-									return timeMs >= annotation.startMs && timeMs < annotation.endMs;
-								});
-
-								const filteredBlurRegions = (blurRegions || []).filter((blurRegion) => {
-									if (
-										typeof blurRegion.startMs !== "number" ||
-										typeof blurRegion.endMs !== "number"
-									)
-										return false;
-
-									if (blurRegion.id === selectedBlurId) return true;
-
-									const timeMs = Math.round(currentTime * 1000);
-									return timeMs >= blurRegion.startMs && timeMs < blurRegion.endMs;
-								});
-
-								const sorted = [
-									...filteredAnnotations.map((annotation) => ({
-										kind: "annotation" as const,
-										region: annotation,
-									})),
-									...filteredBlurRegions.map((blurRegion) => ({
-										kind: "blur" as const,
-										region: blurRegion,
-									})),
-								].sort((a, b) => a.region.zIndex - b.region.zIndex);
-								const previewSnapshotCanvas =
-									filteredBlurRegions.length > 0
-										? (() => {
-												const app = appRef.current;
-												if (!app?.renderer?.extract) return null;
-												try {
-													return app.renderer.extract.canvas(app.stage);
-												} catch {
-													return null;
-												}
-											})()
-										: null;
-
-								// Handle click-through cycling: when clicking same annotation, cycle to next
-								const handleAnnotationClick = (clickedId: string) => {
-									if (!onSelectAnnotation) return;
-
-									// If clicking on already selected annotation and there are multiple overlapping
-									if (clickedId === selectedAnnotationId && filteredAnnotations.length > 1) {
-										// Find current index and cycle to next
-										const currentIndex = filteredAnnotations.findIndex((a) => a.id === clickedId);
-										const nextIndex = (currentIndex + 1) % filteredAnnotations.length;
-										onSelectAnnotation(filteredAnnotations[nextIndex].id);
-									} else {
-										// First click or clicking different annotation
-										onSelectAnnotation(clickedId);
-									}
-								};
-
-								const handleBlurClick = (clickedId: string) => {
-									if (!onSelectBlur) return;
-
-									if (clickedId === selectedBlurId && filteredBlurRegions.length > 1) {
-										const currentIndex = filteredBlurRegions.findIndex((a) => a.id === clickedId);
-										const nextIndex = (currentIndex + 1) % filteredBlurRegions.length;
-										onSelectBlur(filteredBlurRegions[nextIndex].id);
-									} else {
-										onSelectBlur(clickedId);
-									}
-								};
-
-								return sorted.map((item) => (
-									<AnnotationOverlay
-										key={
-											item.kind === "blur"
-												? `${item.region.id}-${overlaySize.width}-${overlaySize.height}-${item.region.blurData?.type ?? "blur"}-${item.region.blurData?.shape ?? "rectangle"}-${item.region.blurData?.color ?? "white"}-${Math.round(item.region.blurData?.blockSize ?? 0)}-${Math.round(item.region.blurData?.intensity ?? 0)}-${(item.region.blurData?.freehandPoints ?? []).map((p) => `${Math.round(p.x)}_${Math.round(p.y)}`).join("-")}`
-												: `${item.region.id}-${overlaySize.width}-${overlaySize.height}`
-										}
-										annotation={item.region}
-										isSelected={
-											item.kind === "blur"
-												? item.region.id === selectedBlurId
-												: item.region.id === selectedAnnotationId
-										}
-										containerWidth={overlaySize.width}
-										containerHeight={overlaySize.height}
-										onPositionChange={(id, position) =>
-											item.kind === "blur"
-												? onBlurPositionChange?.(id, position)
-												: onAnnotationPositionChange?.(id, position)
-										}
-										onSizeChange={(id, size) =>
-											item.kind === "blur"
-												? onBlurSizeChange?.(id, size)
-												: onAnnotationSizeChange?.(id, size)
-										}
-										onBlurDataChange={
-											item.kind === "blur"
-												? (id, blurData) => onBlurDataChange?.(id, blurData)
-												: undefined
-										}
-										onBlurDataCommit={item.kind === "blur" ? onBlurDataCommit : undefined}
-										onClick={item.kind === "blur" ? handleBlurClick : handleAnnotationClick}
-										zIndex={item.region.zIndex}
-										isSelectedBoost={
-											item.kind === "blur"
-												? item.region.id === selectedBlurId
-												: item.region.id === selectedAnnotationId
-										}
-										previewSourceCanvas={previewSnapshotCanvas}
-										previewFrameVersion={Math.round(currentTime * 1000)}
-									/>
-								));
-							})()}
+							Layer 1
 						</div>
 					)}
-				</div>
-				{/* Clip the native cursor overlay to the exact video canvas boundary.
+					<div
+						ref={composite3DRef}
+						className="absolute inset-0"
+						style={{
+							transformStyle: "preserve-3d",
+							transformOrigin: "center center",
+							// Phase 6.5: when the primary is a draggable tile, kill
+							// pointer events on the content so the Rnd above
+							// receives drag/resize gestures across the entire
+							// tile. Internal annotation / zoom focus editing is
+							// disabled in this mode (matches additional layers).
+							pointerEvents: enablePrimaryTile ? "none" : "auto",
+						}}
+					>
+						<div
+							ref={containerRef}
+							className="absolute inset-0"
+							style={{
+								filter:
+									showShadow && shadowIntensity > 0
+										? `drop-shadow(0 ${shadowIntensity * 12}px ${shadowIntensity * 48}px rgba(0,0,0,${shadowIntensity * 0.7})) drop-shadow(0 ${shadowIntensity * 4}px ${shadowIntensity * 16}px rgba(0,0,0,${shadowIntensity * 0.5})) drop-shadow(0 ${shadowIntensity * 2}px ${shadowIntensity * 8}px rgba(0,0,0,${shadowIntensity * 0.3}))`
+										: "none",
+							}}
+						/>
+						{webcamVideoPath &&
+							(() => {
+								const clipPath = getCssClipPath(webcamLayout?.maskShape ?? "rectangle");
+								const useClipPath = !!clipPath;
+								return (
+									<div
+										className="absolute"
+										style={{
+											left: webcamLayout?.x ?? 0,
+											top: webcamLayout?.y ?? 0,
+											width: webcamLayout?.width ?? 0,
+											height: webcamLayout?.height ?? 0,
+											zIndex: 20,
+											opacity: webcamLayout ? 1 : 0,
+											filter:
+												useClipPath && webcamCssBoxShadow !== "none"
+													? `drop-shadow(${webcamCssBoxShadow})`
+													: undefined,
+										}}
+									>
+										<video
+											ref={webcamVideoRef}
+											src={webcamVideoPath}
+											className={`w-full h-full object-cover ${webcamLayoutPreset === "picture-in-picture" ? "cursor-grab active:cursor-grabbing" : "pointer-events-none"}`}
+											style={{
+												borderRadius: useClipPath ? 0 : (webcamLayout?.borderRadius ?? 0),
+												clipPath: clipPath ?? undefined,
+												boxShadow: useClipPath ? "none" : webcamCssBoxShadow,
+												backgroundColor: "#000",
+											}}
+											onPointerDown={handleWebcamPointerDown}
+											onPointerMove={handleWebcamPointerMove}
+											onPointerUp={handleWebcamPointerUp}
+											onPointerLeave={handleWebcamPointerUp}
+											muted
+											preload="metadata"
+											playsInline
+										/>
+									</div>
+								);
+							})()}
+						{/* Only render overlay after PIXI and video are fully initialized */}
+						{pixiReady && videoReady && (
+							<div
+								ref={setOverlayRefs}
+								className="absolute inset-0 select-none"
+								style={{ pointerEvents: "auto", zIndex: 30 }}
+								onPointerDown={handleOverlayPointerDown}
+								onPointerMove={handleOverlayPointerMove}
+								onPointerUp={handleOverlayPointerUp}
+								onPointerLeave={handleOverlayPointerLeave}
+							>
+								<div
+									ref={focusIndicatorRef}
+									className="absolute rounded-md border border-[#34B27B]/80 bg-[#34B27B]/20 shadow-[0_0_0_1px_rgba(52,178,123,0.35)]"
+									style={{ display: "none", pointerEvents: "none" }}
+								/>
+								{(() => {
+									const filteredAnnotations = (annotationRegions || []).filter((annotation) => {
+										if (
+											typeof annotation.startMs !== "number" ||
+											typeof annotation.endMs !== "number"
+										)
+											return false;
+
+										if (annotation.id === selectedAnnotationId) return true;
+
+										const timeMs = Math.round(currentTime * 1000);
+										return timeMs >= annotation.startMs && timeMs < annotation.endMs;
+									});
+
+									const filteredBlurRegions = (blurRegions || []).filter((blurRegion) => {
+										if (
+											typeof blurRegion.startMs !== "number" ||
+											typeof blurRegion.endMs !== "number"
+										)
+											return false;
+
+										if (blurRegion.id === selectedBlurId) return true;
+
+										const timeMs = Math.round(currentTime * 1000);
+										return timeMs >= blurRegion.startMs && timeMs < blurRegion.endMs;
+									});
+
+									const sorted = [
+										...filteredAnnotations.map((annotation) => ({
+											kind: "annotation" as const,
+											region: annotation,
+										})),
+										...filteredBlurRegions.map((blurRegion) => ({
+											kind: "blur" as const,
+											region: blurRegion,
+										})),
+									].sort((a, b) => a.region.zIndex - b.region.zIndex);
+									const previewSnapshotCanvas =
+										filteredBlurRegions.length > 0
+											? (() => {
+													const app = appRef.current;
+													if (!app?.renderer?.extract) return null;
+													try {
+														return app.renderer.extract.canvas(app.stage);
+													} catch {
+														return null;
+													}
+												})()
+											: null;
+
+									// Handle click-through cycling: when clicking same annotation, cycle to next
+									const handleAnnotationClick = (clickedId: string) => {
+										if (!onSelectAnnotation) return;
+
+										// If clicking on already selected annotation and there are multiple overlapping
+										if (clickedId === selectedAnnotationId && filteredAnnotations.length > 1) {
+											// Find current index and cycle to next
+											const currentIndex = filteredAnnotations.findIndex((a) => a.id === clickedId);
+											const nextIndex = (currentIndex + 1) % filteredAnnotations.length;
+											onSelectAnnotation(filteredAnnotations[nextIndex].id);
+										} else {
+											// First click or clicking different annotation
+											onSelectAnnotation(clickedId);
+										}
+									};
+
+									const handleBlurClick = (clickedId: string) => {
+										if (!onSelectBlur) return;
+
+										if (clickedId === selectedBlurId && filteredBlurRegions.length > 1) {
+											const currentIndex = filteredBlurRegions.findIndex((a) => a.id === clickedId);
+											const nextIndex = (currentIndex + 1) % filteredBlurRegions.length;
+											onSelectBlur(filteredBlurRegions[nextIndex].id);
+										} else {
+											onSelectBlur(clickedId);
+										}
+									};
+
+									return sorted.map((item) => (
+										<AnnotationOverlay
+											key={
+												item.kind === "blur"
+													? `${item.region.id}-${overlaySize.width}-${overlaySize.height}-${item.region.blurData?.type ?? "blur"}-${item.region.blurData?.shape ?? "rectangle"}-${item.region.blurData?.color ?? "white"}-${Math.round(item.region.blurData?.blockSize ?? 0)}-${Math.round(item.region.blurData?.intensity ?? 0)}-${(item.region.blurData?.freehandPoints ?? []).map((p) => `${Math.round(p.x)}_${Math.round(p.y)}`).join("-")}`
+													: `${item.region.id}-${overlaySize.width}-${overlaySize.height}`
+											}
+											annotation={item.region}
+											isSelected={
+												item.kind === "blur"
+													? item.region.id === selectedBlurId
+													: item.region.id === selectedAnnotationId
+											}
+											containerWidth={overlaySize.width}
+											containerHeight={overlaySize.height}
+											onPositionChange={(id, position) =>
+												item.kind === "blur"
+													? onBlurPositionChange?.(id, position)
+													: onAnnotationPositionChange?.(id, position)
+											}
+											onSizeChange={(id, size) =>
+												item.kind === "blur"
+													? onBlurSizeChange?.(id, size)
+													: onAnnotationSizeChange?.(id, size)
+											}
+											onBlurDataChange={
+												item.kind === "blur"
+													? (id, blurData) => onBlurDataChange?.(id, blurData)
+													: undefined
+											}
+											onBlurDataCommit={item.kind === "blur" ? onBlurDataCommit : undefined}
+											onClick={item.kind === "blur" ? handleBlurClick : handleAnnotationClick}
+											zIndex={item.region.zIndex}
+											isSelectedBoost={
+												item.kind === "blur"
+													? item.region.id === selectedBlurId
+													: item.region.id === selectedAnnotationId
+											}
+											previewSourceCanvas={previewSnapshotCanvas}
+											previewFrameVersion={Math.round(currentTime * 1000)}
+										/>
+									));
+								})()}
+							</div>
+						)}
+					</div>
+					{/* Clip the native cursor overlay to the exact video canvas boundary.
 				    Placed OUTSIDE composite3DRef (preserve-3d) so clip-path works
 				    correctly even during 3D zoom rotation regions.
-				    clip-path is set dynamically to the camera-aware video bounds. */}
-				<div
-					ref={nativeCursorClipRef}
-					className="absolute inset-0"
-					style={{ zIndex: 18, pointerEvents: "none" }}
-				>
-					<img
-						ref={nativeCursorImageRef}
-						alt=""
-						aria-hidden="true"
-						className="absolute left-0 top-0 select-none"
-						style={{
-							display: "none",
-							pointerEvents: "none",
-							transformOrigin: "0 0",
-						}}
-					/>
-				</div>
+				    clip-path is set dynamically to the camera-aware video bounds.
+				    Phase 6.5: lives inside the primary Rnd so the cursor follows
+				    the primary tile when the user drags / resizes it. */}
+					<div
+						ref={nativeCursorClipRef}
+						className="absolute inset-0"
+						style={{ zIndex: 18, pointerEvents: "none" }}
+					>
+						<img
+							ref={nativeCursorImageRef}
+							alt=""
+							aria-hidden="true"
+							className="absolute left-0 top-0 select-none"
+							style={{
+								display: "none",
+								pointerEvents: "none",
+								transformOrigin: "0 0",
+							}}
+						/>
+					</div>
+				</Rnd>
 				<video
 					ref={videoRef}
 					src={videoPath}
@@ -2262,7 +2473,15 @@ function MultiLayerOverlay({
 	const haveStage = stageWidth > 0 && stageHeight > 0;
 
 	return (
-		<div ref={containerRef} className="absolute inset-0" style={{ zIndex: 30 }}>
+		// Phase 6.5 fix: the outer container spans the whole stage so we can
+		// measure stage size for the px<->normalized math, but it must let
+		// pointer events fall through to the primary Rnd underneath. Inner
+		// Rnd tiles below re-enable pointerEvents on themselves.
+		<div
+			ref={containerRef}
+			className="absolute inset-0"
+			style={{ zIndex: 30, pointerEvents: "none" }}
+		>
 			{paths.map((path, idx) => {
 				const layerId = layerIds[idx];
 				const transform = layerId ? transformByLayerId.get(layerId) : undefined;
@@ -2335,6 +2554,7 @@ function MultiLayerOverlay({
 							overflow: "hidden",
 							background: "rgba(0,0,0,0.6)",
 							boxShadow: "0 4px 12px rgba(0,0,0,0.5)",
+							pointerEvents: "auto",
 						}}
 					>
 						<video

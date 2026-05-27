@@ -392,11 +392,13 @@ export default function VideoEditor() {
 			// Phase 4.5: synthesize default transforms when v3 media has no
 			// persisted layerTransforms yet. Keeps the editor authoritative
 			// even on first open of a freshly recorded multi-source session.
+			// Padding is fed in so the primary Rnd defaults to the padded
+			// video content area instead of swallowing the wallpaper.
 			const resolvedLayerTransforms: LayerTransform[] =
 				normalizedEditor.layerTransforms && normalizedEditor.layerTransforms.length > 0
 					? normalizedEditor.layerTransforms
 					: projectMediaV3
-						? defaultLayerTransformsForMedia(projectMediaV3)
+						? defaultLayerTransformsForMedia(projectMediaV3, normalizedEditor.padding)
 						: [];
 			const inferredDurationMs = Math.max(
 				0,
@@ -2287,6 +2289,7 @@ export default function VideoEditor() {
 												videoPath={videoPath || ""}
 												additionalLayerPaths={additionalLayerPaths}
 												additionalLayerIds={additionalLayerIds}
+												primaryLayerId={availableLayers[0]?.id ?? null}
 												layerTransforms={layerTransforms}
 												onLayerTransformUpdate={handleLayerTransformUpdate}
 												onLayerTransformCommit={commitState}

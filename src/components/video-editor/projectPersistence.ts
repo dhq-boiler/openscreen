@@ -584,19 +584,49 @@ function normalizeLayerTransforms(raw: unknown[]): LayerTransform[] {
 
 /**
  * Build default LayerTransforms for a v3 media that has none persisted yet.
- * Each layer gets a full-stage transform stacked by index. Used both for
- * the v2→v3 migration and as a fallback when loading projects whose
- * editor state predates v3.
+ *
+ * - Primary layer (index 0) is centered and sized to the padded video
+ *   content area so the editor's drag/resize Rnd wraps the actual primary
+ *   frame, not the full wallpaper. paddingPercent matches the editor's
+ *   padding slider (0-100) and uses the same `1 - (p/100) * 0.4` mapping
+ *   as layoutUtils#computeBaseLayout.
+ * - Additional layers (index ≥ 1) get a small bottom-aligned tile so the
+ *   default placement matches the picture-in-picture pattern users expect
+ *   from the multi-window UI; the user can drag/resize from there.
  */
-export function defaultLayerTransformsForMedia(media: ProjectMediaV3): LayerTransform[] {
-	return media.layers.map((layer, index) => ({
-		layerId: layer.id,
-		position: { cx: 0.5, cy: 0.5 },
-		size: { width: 1, height: 1 },
-		rotation: 0,
-		zOrder: index,
-		visible: true,
-	}));
+export function defaultLayerTransformsForMedia(
+	media: ProjectMediaV3,
+	paddingPercent: number = 0,
+): LayerTransform[] {
+	const clampedPadding = Math.max(0, Math.min(100, paddingPercent));
+	const primaryScale = 1.0 - (clampedPadding / 100) * 0.4;
+	const tileWidth = 0.18;
+	const tileHeight = 0.18 * (9 / 16);
+	const tileMargin = 0.02;
+	return media.layers.map((layer, index) => {
+		if (index === 0) {
+			return {
+				layerId: layer.id,
+				position: { cx: 0.5, cy: 0.5 },
+				size: { width: primaryScale, height: primaryScale },
+				rotation: 0,
+				zOrder: 0,
+				visible: true,
+			};
+		}
+		// Stack additional tiles along the bottom edge, growing left-to-right.
+		const additionalIndex = index - 1;
+		const cx = tileMargin + tileWidth / 2 + additionalIndex * (tileWidth + tileMargin);
+		const cy = 1 - tileMargin - tileHeight / 2;
+		return {
+			layerId: layer.id,
+			position: { cx, cy },
+			size: { width: tileWidth, height: tileHeight },
+			rotation: 0,
+			zOrder: index,
+			visible: true,
+		};
+	});
 }
 
 export function createProjectData(
