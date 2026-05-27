@@ -193,6 +193,12 @@ export default function VideoEditor() {
 	// Phase 4.5: layer ids matched 1:1 with additionalLayerPaths. Required so
 	// MultiLayerOverlay can resolve which LayerTransform belongs to each tile.
 	const [additionalLayerIds, setAdditionalLayerIds] = useState<string[]>([]);
+	// Phase 5 UI: full layer roster (primary + additional) used by the zoom
+	// settings panel to let the user choose which layer a ZoomRegion targets.
+	// Empty for v2 projects; populated only when a v3 multi-layer media loads.
+	const [availableLayers, setAvailableLayers] = useState<
+		Array<{ id: string; label: string; isPrimary: boolean }>
+	>([]);
 	const [videoSourcePath, setVideoSourcePath] = useState<string | null>(null);
 	const [webcamVideoPath, setWebcamVideoPath] = useState<string | null>(null);
 	const [webcamVideoSourcePath, setWebcamVideoSourcePath] = useState<string | null>(null);
@@ -351,8 +357,20 @@ export default function VideoEditor() {
 				projectMediaV3 && projectMediaV3.layers.length > 1
 					? projectMediaV3.layers.slice(1).map((layer) => layer.id)
 					: [];
+			// Phase 5 UI: build the layer roster so SettingsPanel can offer
+			// "Apply zoom to: Stage / Layer 1 / Layer 2 / ...". Single-source
+			// projects keep an empty roster and the picker stays hidden.
+			const layerRoster =
+				projectMediaV3 && projectMediaV3.layers.length > 1
+					? projectMediaV3.layers.map((layer, idx) => ({
+							id: layer.id,
+							label: idx === 0 ? "Layer 1 (primary)" : `Layer ${idx + 1}`,
+							isPrimary: idx === 0,
+						}))
+					: [];
 			setAdditionalLayerPaths(extraLayerPaths);
 			setAdditionalLayerIds(extraLayerIds);
+			setAvailableLayers(layerRoster);
 			const normalizedEditor = normalizeProjectEditor(project.editor);
 			// Phase 4.5: synthesize default transforms when v3 media has no
 			// persisted layerTransforms yet. Keeps the editor authoritative
@@ -1017,6 +1035,26 @@ export default function VideoEditor() {
 							}
 						: region,
 				),
+			}));
+		},
+		[selectedZoomId, pushState],
+	);
+
+	// Phase 5 UI: rebind a ZoomRegion to a specific layer (or back to the
+	// stage when layerId is null). Stored on the region itself; zoom focus
+	// resolution against the target layer's rect is Phase 5.5 (zoomTransform).
+	const handleZoomLayerChange = useCallback(
+		(layerId: string | null) => {
+			if (!selectedZoomId) return;
+			pushState((prev) => ({
+				zoomRegions: prev.zoomRegions.map((region) => {
+					if (region.id !== selectedZoomId) return region;
+					if (layerId === null) {
+						const { layerId: _omit, ...rest } = region;
+						return rest;
+					}
+					return { ...region, layerId };
+				}),
 			}));
 		},
 		[selectedZoomId, pushState],
@@ -2330,6 +2368,13 @@ export default function VideoEditor() {
 											: null
 									}
 									onZoomRotationPresetChange={handleZoomRotationPresetChange}
+									availableLayers={availableLayers}
+									selectedZoomLayerId={
+										selectedZoomId
+											? (zoomRegions.find((z) => z.id === selectedZoomId)?.layerId ?? null)
+											: null
+									}
+									onZoomLayerChange={handleZoomLayerChange}
 									selectedTrimId={selectedTrimId}
 									onTrimDelete={handleTrimDelete}
 									shadowIntensity={shadowIntensity}

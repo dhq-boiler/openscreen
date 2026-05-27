@@ -251,6 +251,12 @@ interface SettingsPanelProps {
 	onZoomDelete?: (id: string) => void;
 	selectedZoomRotationPreset?: Rotation3DPreset | null;
 	onZoomRotationPresetChange?: (preset: Rotation3DPreset | null) => void;
+	// Phase 5 UI: layer roster + current target for the selected ZoomRegion.
+	// Picker stays hidden unless availableLayers.length > 1 (multi-source v3).
+	// selectedZoomLayerId === null means "stage" (no per-layer binding).
+	availableLayers?: Array<{ id: string; label: string; isPrimary: boolean }>;
+	selectedZoomLayerId?: string | null;
+	onZoomLayerChange?: (layerId: string | null) => void;
 	selectedTrimId?: string | null;
 	onTrimDelete?: (id: string) => void;
 	shadowIntensity?: number;
@@ -383,6 +389,9 @@ export function SettingsPanel({
 	onZoomDelete,
 	selectedZoomRotationPreset,
 	onZoomRotationPresetChange,
+	availableLayers = [],
+	selectedZoomLayerId = null,
+	onZoomLayerChange,
 	selectedTrimId,
 	onTrimDelete,
 	shadowIntensity = 0,
@@ -951,6 +960,45 @@ export function SettingsPanel({
 													<span className="text-[10px] font-semibold capitalize">
 														{t(`zoom.focusMode.${mode}`)}
 													</span>
+												</Button>
+											);
+										})}
+									</div>
+								</div>
+							)}
+							{zoomEnabled && availableLayers.length > 1 && onZoomLayerChange && (
+								<div>
+									<span className="text-[11px] font-medium text-slate-400 mb-1.5 block">
+										Apply zoom to
+									</span>
+									<div className="flex flex-col gap-1 rounded-lg border border-white/[0.06] bg-white/[0.035] p-0.5">
+										<Button
+											type="button"
+											onClick={() => onZoomLayerChange(null)}
+											className={cn(
+												"h-7 w-full rounded-md border px-2 text-left transition-all duration-150 ease-out cursor-pointer",
+												selectedZoomLayerId == null
+													? "border-[#34B27B]/50 bg-[#34B27B] text-white"
+													: "border-transparent bg-transparent text-slate-400 hover:bg-white/[0.06] hover:text-slate-200",
+											)}
+										>
+											<span className="text-[10px] font-semibold">Stage (entire frame)</span>
+										</Button>
+										{availableLayers.map((layer) => {
+											const isActive = selectedZoomLayerId === layer.id;
+											return (
+												<Button
+													key={layer.id}
+													type="button"
+													onClick={() => onZoomLayerChange(layer.id)}
+													className={cn(
+														"h-7 w-full rounded-md border px-2 text-left transition-all duration-150 ease-out cursor-pointer",
+														isActive
+															? "border-[#34B27B]/50 bg-[#34B27B] text-white"
+															: "border-transparent bg-transparent text-slate-400 hover:bg-white/[0.06] hover:text-slate-200",
+													)}
+												>
+													<span className="text-[10px] font-semibold">{layer.label}</span>
 												</Button>
 											);
 										})}
