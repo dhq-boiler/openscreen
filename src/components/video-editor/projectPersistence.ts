@@ -300,6 +300,9 @@ export function normalizeProjectEditor(editor: Partial<ProjectEditorState>): Pro
 						},
 						focusMode: region.focusMode === "auto" ? "auto" : "manual",
 						...(validPreset ? { rotationPreset: validPreset } : {}),
+						...(typeof region.layerId === "string" && region.layerId.trim().length > 0
+							? { layerId: region.layerId.trim() }
+							: {}),
 					};
 				})
 		: [];

@@ -67,6 +67,19 @@ export interface ZoomRegion {
 	rotationPreset?: Rotation3DPreset;
 	/** Custom scale overriding the preset depth (1.0–5.0, two decimal precision). */
 	customScale?: number;
+	/**
+	 * Phase 5: optional layer id this zoom region targets. When undefined,
+	 * zoom applies to the whole composition (legacy single-layer behavior).
+	 * When set to a VideoLayer.id from the v3 media, the editor resolves
+	 * focus coordinates relative to that layer's stage rectangle and the
+	 * exported composition zooms toward that layer.
+	 *
+	 * Wired into persistence (projectPersistence.normalizeProjectEditor)
+	 * and the type system. The runtime zoomTransform.ts integration is a
+	 * Phase 5.5 follow-up — for now the field round-trips correctly but
+	 * the zoom math still treats every region as stage-relative.
+	 */
+	layerId?: string;
 }
 
 export function getRotation3D(region: Pick<ZoomRegion, "rotationPreset">): Rotation3D {

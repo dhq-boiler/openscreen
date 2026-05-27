@@ -18,6 +18,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { Rnd } from "react-rnd";
 import {
 	getWebcamLayoutCssBoxShadow,
 	type Size,
@@ -2121,10 +2122,13 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 );
 
 /**
- * Phase 3 minimum: show extra recorded layers as a small picture-strip
- * along the top of the editor preview. Each video is muted, synced to the
- * primary playhead, and not part of the export pipeline (that's tracked
- * in the design doc as a Phase 3.5/6 follow-up).
+ * Phase 3/4 multi-layer overlay. Renders each additional v3 layer as a
+ * draggable + resizable picture-in-picture tile floating above the
+ * primary PixiJS canvas. Each tile is synced to the primary playhead.
+ *
+ * Positions/sizes are local to this component for now — Phase 4.5 will
+ * lift them into VideoEditor state and useEditorHistory so they survive
+ * project saves and join undo/redo.
  */
 function MultiLayerOverlay({
 	paths,
@@ -2136,6 +2140,24 @@ function MultiLayerOverlay({
 	currentTime: number;
 }) {
 	const videoRefs = useRef<(HTMLVideoElement | null)[]>([]);
+	const [tiles, setTiles] = useState<
+		Array<{ x: number; y: number; width: number; height: number }>
+	>([]);
+
+	useEffect(() => {
+		setTiles((prev) => {
+			const next = paths.map((_path, idx) => {
+				if (prev[idx]) return prev[idx];
+				return {
+					x: 16,
+					y: 16 + idx * 100,
+					width: 160,
+					height: 90,
+				};
+			});
+			return next;
+		});
+	}, [paths]);
 
 	useEffect(() => {
 		for (const video of videoRefs.current) {
@@ -2158,31 +2180,63 @@ function MultiLayerOverlay({
 	if (paths.length === 0) return null;
 
 	return (
-		<div className="pointer-events-none absolute right-4 top-4 flex gap-2" style={{ zIndex: 30 }}>
-			{paths.map((path, idx) => (
-				<div
-					key={`${path}-${idx}`}
-					className="overflow-hidden rounded-md border border-white/20 bg-black/60 shadow-lg"
-					style={{ width: 160, aspectRatio: "16/9" }}
-				>
-					<video
-						ref={(el) => {
-							videoRefs.current[idx] = el;
+		<div className="absolute inset-0" style={{ zIndex: 30 }}>
+			{paths.map((path, idx) => {
+				const tile = tiles[idx];
+				if (!tile) return null;
+				return (
+					<Rnd
+						key={`${path}-${idx}`}
+						size={{ width: tile.width, height: tile.height }}
+						position={{ x: tile.x, y: tile.y }}
+						bounds="parent"
+						lockAspectRatio={16 / 9}
+						minWidth={120}
+						minHeight={68}
+						onDragStop={(_e, d) => {
+							setTiles((prev) => {
+								const next = [...prev];
+								next[idx] = { ...next[idx], x: d.x, y: d.y };
+								return next;
+							});
 						}}
-						src={path}
-						muted
-						playsInline
-						preload="auto"
-						className="h-full w-full object-cover"
-					/>
-				</div>
-			))}
-			<div
-				className="pointer-events-none absolute -bottom-5 right-0 text-[10px] text-white/60"
-				style={{ textShadow: "0 1px 2px rgba(0,0,0,0.8)" }}
-			>
-				{`+${paths.length} layer${paths.length === 1 ? "" : "s"} (preview only, not yet in export)`}
-			</div>
+						onResizeStop={(_e, _dir, ref, _delta, position) => {
+							setTiles((prev) => {
+								const next = [...prev];
+								next[idx] = {
+									x: position.x,
+									y: position.y,
+									width: ref.offsetWidth,
+									height: ref.offsetHeight,
+								};
+								return next;
+							});
+						}}
+						style={{
+							border: "1px solid rgba(255,255,255,0.3)",
+							borderRadius: 6,
+							overflow: "hidden",
+							background: "rgba(0,0,0,0.6)",
+							boxShadow: "0 4px 12px rgba(0,0,0,0.5)",
+						}}
+					>
+						<video
+							ref={(el) => {
+								videoRefs.current[idx] = el;
+							}}
+							src={path}
+							muted
+							playsInline
+							preload="auto"
+							className="h-full w-full object-cover pointer-events-none select-none"
+							draggable={false}
+						/>
+						<div className="pointer-events-none absolute left-1 top-1 rounded bg-black/60 px-1 text-[9px] font-semibold text-white">
+							{`Layer ${idx + 2}`}
+						</div>
+					</Rnd>
+				);
+			})}
 		</div>
 	);
 }
