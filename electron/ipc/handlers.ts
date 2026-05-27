@@ -1493,26 +1493,26 @@ export function registerIpcHandlers(
 
 	// Phase 7: receive a MediaRecorder blob from the renderer (additional
 	// layers captured via getUserMedia + desktopCapturer) and land it in
-	// RECORDINGS_DIR. Path is restricted to that directory + approved for
-	// the rest of the read-path so the editor can load it back.
+	// RECORDINGS_DIR. The renderer hands us a bare file name; the main
+	// process owns the directory so the renderer never needs to know
+	// RECORDINGS_DIR and can't write outside it (path.basename strips any
+	// traversal). approveFilePath then unlocks the file for the editor's
+	// read path.
 	ipcMain.handle(
 		"save-display-media-recording",
-		async (_, payload: { outputPath: string; data: ArrayBuffer }) => {
-			if (!payload?.outputPath || !payload?.data) {
+		async (_, payload: { fileName: string; data: ArrayBuffer }) => {
+			if (!payload?.fileName || !payload?.data) {
 				return { success: false, error: "Invalid payload" };
 			}
-			const normalized = path.resolve(payload.outputPath);
-			const recordingsDir = path.resolve(RECORDINGS_DIR);
-			if (!normalized.startsWith(recordingsDir + path.sep)) {
-				return {
-					success: false,
-					error: `Output path must live under RECORDINGS_DIR (${recordingsDir})`,
-				};
+			const safeName = path.basename(payload.fileName);
+			if (!safeName) {
+				return { success: false, error: "Invalid file name" };
 			}
+			const fullPath = path.join(RECORDINGS_DIR, safeName);
 			try {
-				await fs.writeFile(normalized, Buffer.from(payload.data));
-				approveFilePath(normalized);
-				return { success: true, outputPath: normalized };
+				await fs.writeFile(fullPath, Buffer.from(payload.data));
+				approveFilePath(fullPath);
+				return { success: true, outputPath: fullPath };
 			} catch (err) {
 				return { success: false, error: (err as Error).message };
 			}

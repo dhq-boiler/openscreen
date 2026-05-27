@@ -56,9 +56,10 @@ interface Window {
 		/**
 		 * Phase 7: persist a MediaRecorder blob from the renderer (additional
 		 * layers captured via desktopCapturer + getUserMedia) to a file under
-		 * RECORDINGS_DIR. outputPath must already live under that directory.
+		 * RECORDINGS_DIR. Renderer only sends a base file name; the main
+		 * process owns the directory.
 		 */
-		saveDisplayMediaRecording: (payload: { outputPath: string; data: ArrayBuffer }) => Promise<{
+		saveDisplayMediaRecording: (payload: { fileName: string; data: ArrayBuffer }) => Promise<{
 			success: boolean;
 			outputPath?: string;
 			error?: string;

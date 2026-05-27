@@ -603,6 +603,11 @@ export function defaultLayerTransformsForMedia(
 	const tileWidth = 0.18;
 	const tileHeight = 0.18 * (9 / 16);
 	const tileMargin = 0.02;
+	// zOrder is descending so the primary starts on top of the additional
+	// picture-in-picture tiles. Users can flip the order via the Layer
+	// order UI in SettingsPanel; the field is just an integer hint that
+	// gets translated into a CSS z-index at render time.
+	const layerCount = media.layers.length;
 	return media.layers.map((layer, index) => {
 		if (index === 0) {
 			return {
@@ -610,7 +615,7 @@ export function defaultLayerTransformsForMedia(
 				position: { cx: 0.5, cy: 0.5 },
 				size: { width: primaryScale, height: primaryScale },
 				rotation: 0,
-				zOrder: 0,
+				zOrder: layerCount,
 				visible: true,
 			};
 		}
@@ -623,7 +628,7 @@ export function defaultLayerTransformsForMedia(
 			position: { cx, cy },
 			size: { width: tileWidth, height: tileHeight },
 			rotation: 0,
-			zOrder: index,
+			zOrder: layerCount - index,
 			visible: true,
 		};
 	});

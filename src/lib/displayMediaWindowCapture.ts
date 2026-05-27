@@ -21,8 +21,12 @@ export interface DisplayMediaWindowCaptureHandle {
 export interface DisplayMediaWindowCaptureOptions {
 	/** desktopCapturer source id (e.g. "window:12345:0") */
 	sourceId: string;
-	/** Absolute path the encoded blob should land at on disk. */
-	outputPath: string;
+	/**
+	 * File name (basename only) the encoded blob should be saved as. The
+	 * main process joins this with RECORDINGS_DIR; renderer can't see that
+	 * path directly so we keep the API one-sided.
+	 */
+	fileName: string;
 	/** Target capture frame rate. Chromium caps to display refresh anyway. */
 	fps: number;
 	/** Optional max width / height — useful to bound encode bitrate. */
@@ -91,7 +95,7 @@ export async function startDisplayMediaWindowCapture(
 	return {
 		stop: async () => {
 			if (recorder.state === "inactive") {
-				return { outputPath: options.outputPath, mimeType };
+				return { outputPath: "", mimeType };
 			}
 			recorder.stop();
 			await stopPromise;
@@ -100,11 +104,14 @@ export async function startDisplayMediaWindowCapture(
 			const effectiveType = mimeType || recorder.mimeType || "video/webm";
 			const blob = new Blob(chunks, { type: effectiveType });
 			const arrayBuffer = await blob.arrayBuffer();
-			await window.electronAPI.saveDisplayMediaRecording({
-				outputPath: options.outputPath,
+			const saved = await window.electronAPI.saveDisplayMediaRecording({
+				fileName: options.fileName,
 				data: arrayBuffer,
 			});
-			return { outputPath: options.outputPath, mimeType: effectiveType };
+			if (!saved.success || !saved.outputPath) {
+				throw new Error(saved.error ?? "save-display-media-recording failed");
+			}
+			return { outputPath: saved.outputPath, mimeType: effectiveType };
 		},
 		pause: () => {
 			if (recorder.state === "recording") {

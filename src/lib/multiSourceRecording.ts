@@ -62,7 +62,8 @@ export interface MultiSourceTargetMac extends MultiSourceTargetCommon {
 export interface MultiSourceTargetDisplayMedia extends MultiSourceTargetCommon {
 	platform: "display-media";
 	sourceId: string;
-	outputPath: string;
+	/** Base file name; main process joins with RECORDINGS_DIR. */
+	fileName: string;
 	fps: number;
 	maxWidth?: number;
 	maxHeight?: number;
@@ -129,12 +130,14 @@ async function startOneTarget(
 	if (target.platform === "display-media") {
 		const handle = await startDisplayMediaWindowCapture({
 			sourceId: target.sourceId,
-			outputPath: target.outputPath,
+			fileName: target.fileName,
 			fps: target.fps,
 			maxWidth: target.maxWidth,
 			maxHeight: target.maxHeight,
 		});
-		return { screenVideoPath: target.outputPath, displayMediaHandle: handle };
+		// Provisional path: stopOneTarget will refresh this with the
+		// definitive on-disk path the main process resolved.
+		return { screenVideoPath: target.fileName, displayMediaHandle: handle };
 	}
 
 	const api = getElectronAPI();

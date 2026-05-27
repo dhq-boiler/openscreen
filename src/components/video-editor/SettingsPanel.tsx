@@ -257,6 +257,11 @@ interface SettingsPanelProps {
 	availableLayers?: Array<{ id: string; label: string; isPrimary: boolean }>;
 	selectedZoomLayerId?: string | null;
 	onZoomLayerChange?: (layerId: string | null) => void;
+	// Phase 8: layer roster sorted by zOrder descending (top-to-bottom in
+	// the editor preview) + a callback that swaps the picked layer with
+	// the one above / below it.
+	layerOrder?: Array<{ id: string; label: string; zOrder: number }>;
+	onLayerZOrderChange?: (layerId: string, direction: "forward" | "backward") => void;
 	selectedTrimId?: string | null;
 	onTrimDelete?: (id: string) => void;
 	shadowIntensity?: number;
@@ -392,6 +397,8 @@ export function SettingsPanel({
 	availableLayers = [],
 	selectedZoomLayerId = null,
 	onZoomLayerChange,
+	layerOrder = [],
+	onLayerZOrderChange,
 	selectedTrimId,
 	onTrimDelete,
 	shadowIntensity = 0,
@@ -1002,6 +1009,55 @@ export function SettingsPanel({
 												</Button>
 											);
 										})}
+									</div>
+								</div>
+							)}
+							{layerOrder.length > 1 && onLayerZOrderChange && (
+								<div>
+									<span className="text-[11px] font-medium text-slate-400 mb-1.5 block">
+										Layer order (front → back)
+									</span>
+									<div className="flex flex-col gap-1 rounded-lg border border-white/[0.06] bg-white/[0.035] p-0.5">
+										{[...layerOrder]
+											.sort((a, b) => b.zOrder - a.zOrder)
+											.map((layer, idx, arr) => (
+												<div
+													key={layer.id}
+													className="flex items-center justify-between gap-2 px-2 py-1"
+												>
+													<span className="text-[10px] text-slate-300 truncate flex-1">
+														{layer.label}
+													</span>
+													<div className="flex gap-1">
+														<Button
+															type="button"
+															onClick={() => onLayerZOrderChange(layer.id, "forward")}
+															disabled={idx === 0}
+															className={cn(
+																"h-5 w-5 rounded border border-white/[0.08] bg-white/[0.04] text-[10px] text-slate-300",
+																idx === 0
+																	? "opacity-30 cursor-not-allowed"
+																	: "hover:bg-white/[0.08] hover:text-slate-100 cursor-pointer",
+															)}
+														>
+															↑
+														</Button>
+														<Button
+															type="button"
+															onClick={() => onLayerZOrderChange(layer.id, "backward")}
+															disabled={idx === arr.length - 1}
+															className={cn(
+																"h-5 w-5 rounded border border-white/[0.08] bg-white/[0.04] text-[10px] text-slate-300",
+																idx === arr.length - 1
+																	? "opacity-30 cursor-not-allowed"
+																	: "hover:bg-white/[0.08] hover:text-slate-100 cursor-pointer",
+															)}
+														>
+															↓
+														</Button>
+													</div>
+												</div>
+											))}
 									</div>
 								</div>
 							)}

@@ -2060,6 +2060,11 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					bounds="parent"
 					disableDragging={!enablePrimaryTile}
 					enableResizing={enablePrimaryTile}
+					// Phase 6.5 fix: don't capture pointerdown that originated
+					// from annotation / blur tiles (they have their own Rnd
+					// nested inside). Without this cancel selector, dragging
+					// an annotation also drags the primary tile underneath.
+					cancel=".annotation-overlay-tile"
 					// Phase 6.5: preserve the video's aspect ratio while
 					// resizing, matching the behavior of additional layer
 					// tiles below. The locked ratio tracks the current size,
@@ -2107,10 +2112,24 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					style={
 						enablePrimaryTile
 							? {
-									zIndex: 10,
+									// Phase 8 z-order: drive Layer 1's zIndex
+									// from its layerTransform.zOrder so the
+									// user-facing Layer order UI in
+									// SettingsPanel can swap it with
+									// additional layers. MultiLayerOverlay
+									// dropped its container zIndex so all
+									// layers share the outerWrapperRef
+									// stacking context — direct comparison
+									// works.
+									zIndex: 10 + (primaryTransform?.zOrder ?? 100),
 									border: "1px solid rgba(255,255,255,0.3)",
 									borderRadius: 6,
-									overflow: "hidden",
+									// overflow stays "visible" so annotation /
+									// blur / zoom focus tiles can extend past
+									// Layer 1's box and overlap Layer 2/3. The
+									// PixiJS canvas is rectangular and stays
+									// inside its own bounds, so this doesn't
+									// break the video render.
 									boxShadow: "0 4px 12px rgba(0,0,0,0.5)",
 									cursor: "move",
 								}
@@ -2434,6 +2453,15 @@ function MultiLayerOverlay({
 		width: 0,
 		height: 0,
 	});
+	// Phase 7 follow-up: cache each layer's natural video aspect so we can
+	// drive lockAspectRatio per-tile (instead of the 16:9 default that
+	// stretches Win11 Notepad / Electron windows in the initial placement).
+	const [naturalAspects, setNaturalAspects] = useState<Record<string, number>>({});
+	// Track which layers already had their initial aspect sync applied so
+	// re-mounts of MultiLayerOverlay don't keep clobbering user-resized
+	// tiles. Since user resize keeps the same aspect (lockAspectRatio),
+	// even if this runs again the result is mathematically the same shape.
+	const initialAspectSyncedRef = useRef<Set<string>>(new Set());
 
 	useEffect(() => {
 		const el = containerRef.current;
@@ -2473,15 +2501,13 @@ function MultiLayerOverlay({
 	const haveStage = stageWidth > 0 && stageHeight > 0;
 
 	return (
-		// Phase 6.5 fix: the outer container spans the whole stage so we can
-		// measure stage size for the px<->normalized math, but it must let
-		// pointer events fall through to the primary Rnd underneath. Inner
-		// Rnd tiles below re-enable pointerEvents on themselves.
-		<div
-			ref={containerRef}
-			className="absolute inset-0"
-			style={{ zIndex: 30, pointerEvents: "none" }}
-		>
+		// Phase 8: dropped zIndex on the container so each tile's Rnd
+		// participates in the outerWrapperRef stacking context directly.
+		// This lets Layer 1's zIndex be compared against Layer 2/3 tiles
+		// for the user-facing Layer order UI. The outer div still spans
+		// the stage for size measurement and lets pointer events fall
+		// through to layers underneath.
+		<div ref={containerRef} className="absolute inset-0" style={{ pointerEvents: "none" }}>
 			{paths.map((path, idx) => {
 				const layerId = layerIds[idx];
 				const transform = layerId ? transformByLayerId.get(layerId) : undefined;
@@ -2502,6 +2528,7 @@ function MultiLayerOverlay({
 				const yPx = transform ? transform.position.cy * stageHeight - heightPx / 2 : 16 + idx * 100;
 
 				const canEdit = Boolean(transform && layerId && onUpdate);
+				const lockedAspect = layerId && naturalAspects[layerId] ? naturalAspects[layerId] : 16 / 9;
 
 				return (
 					<Rnd
@@ -2509,7 +2536,7 @@ function MultiLayerOverlay({
 						size={{ width: widthPx, height: heightPx }}
 						position={{ x: xPx, y: yPx }}
 						bounds="parent"
-						lockAspectRatio={16 / 9}
+						lockAspectRatio={lockedAspect}
 						minWidth={120}
 						minHeight={68}
 						disableDragging={!canEdit}
@@ -2555,6 +2582,10 @@ function MultiLayerOverlay({
 							background: "rgba(0,0,0,0.6)",
 							boxShadow: "0 4px 12px rgba(0,0,0,0.5)",
 							pointerEvents: "auto",
+							// Phase 8 z-order: pull from transform so the
+							// Layer order UI in SettingsPanel controls which
+							// tile sits on top of which.
+							zIndex: 10 + (transform?.zOrder ?? idx),
 						}}
 					>
 						<video
@@ -2567,6 +2598,32 @@ function MultiLayerOverlay({
 							preload="auto"
 							className="h-full w-full object-cover pointer-events-none select-none"
 							draggable={false}
+							onLoadedMetadata={(e) => {
+								const v = e.currentTarget;
+								if (v.videoWidth <= 0 || v.videoHeight <= 0) return;
+								if (!layerId) return;
+								const aspect = v.videoWidth / v.videoHeight;
+								setNaturalAspects((prev) =>
+									prev[layerId] === aspect ? prev : { ...prev, [layerId]: aspect },
+								);
+								// Initial aspect sync: scale the persisted
+								// transform's height to match the natural
+								// aspect, keeping width constant. Runs once
+								// per layer per mount. User-resized tiles
+								// already follow lockAspectRatio so reapplying
+								// the same math gives the same shape — safe.
+								if (initialAspectSyncedRef.current.has(layerId)) return;
+								if (!transform || !onUpdate) return;
+								if (stageWidth <= 0 || stageHeight <= 0) return;
+								const stageAspect = stageWidth / stageHeight;
+								const newHeight = (transform.size.width * stageAspect) / aspect;
+								const clampedHeight = Math.max(0.05, Math.min(1, newHeight));
+								initialAspectSyncedRef.current.add(layerId);
+								onUpdate(layerId, {
+									size: { width: transform.size.width, height: clampedHeight },
+								});
+								onCommit?.();
+							}}
 						/>
 						<div className="pointer-events-none absolute left-1 top-1 rounded bg-black/60 px-1 text-[9px] font-semibold text-white">
 							{`Layer ${idx + 2}`}

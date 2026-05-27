@@ -60,7 +60,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	) => {
 		return ipcRenderer.invoke("write-multi-source-session-manifest", media);
 	},
-	saveDisplayMediaRecording: (payload: { outputPath: string; data: ArrayBuffer }) => {
+	saveDisplayMediaRecording: (payload: { fileName: string; data: ArrayBuffer }) => {
 		return ipcRenderer.invoke("save-display-media-recording", payload);
 	},
 	requestCameraAccess: () => {

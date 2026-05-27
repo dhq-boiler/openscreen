@@ -1077,6 +1077,34 @@ export default function VideoEditor() {
 		[selectedZoomId, pushState],
 	);
 
+	// Phase 8: move a layer one slot forward / backward in z-order. zOrder
+	// is just a sortable integer; the layer with the highest zOrder draws
+	// on top. Operates on the editor history so undo/redo cover the
+	// reorder.
+	const handleLayerZOrderChange = useCallback(
+		(layerId: string, direction: "forward" | "backward") => {
+			pushState((prev) => {
+				const transforms = prev.layerTransforms;
+				const target = transforms.find((t) => t.layerId === layerId);
+				if (!target) return {};
+				// Find the layer adjacent to the target in zOrder.
+				const sortedAsc = [...transforms].sort((a, b) => a.zOrder - b.zOrder);
+				const idx = sortedAsc.findIndex((t) => t.layerId === layerId);
+				const neighborIdx = direction === "forward" ? idx + 1 : idx - 1;
+				if (neighborIdx < 0 || neighborIdx >= sortedAsc.length) return {};
+				const neighbor = sortedAsc[neighborIdx];
+				return {
+					layerTransforms: transforms.map((t) => {
+						if (t.layerId === target.layerId) return { ...t, zOrder: neighbor.zOrder };
+						if (t.layerId === neighbor.layerId) return { ...t, zOrder: target.zOrder };
+						return t;
+					}),
+				};
+			});
+		},
+		[pushState],
+	);
+
 	// Phase 5 UI: rebind a ZoomRegion to a specific layer (or back to the
 	// stage when layerId is null). Stored on the region itself; zoom focus
 	// resolution against the target layer's rect is Phase 5.5 (zoomTransform).
@@ -2413,6 +2441,12 @@ export default function VideoEditor() {
 											: null
 									}
 									onZoomLayerChange={handleZoomLayerChange}
+									layerOrder={availableLayers.map((layer) => ({
+										id: layer.id,
+										label: layer.label,
+										zOrder: layerTransforms.find((t) => t.layerId === layer.id)?.zOrder ?? 0,
+									}))}
+									onLayerZOrderChange={handleLayerZOrderChange}
 									selectedTrimId={selectedTrimId}
 									onTrimDelete={handleTrimDelete}
 									shadowIntensity={shadowIntensity}

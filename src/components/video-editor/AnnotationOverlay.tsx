@@ -554,8 +554,17 @@ export function AnnotationOverlay({
 				if (isDraggingRef.current) return;
 				onClick(annotation.id);
 			}}
-			bounds="parent"
+			// Phase 6.5 fix: bounds="window" instead of "parent" so annotation
+			// tiles can be placed over Layer 2/3 (which live outside Layer 1's
+			// Rnd in multi-source projects). Single-source projects keep the
+			// same effective constraint since Layer 1 covers the stage anyway.
+			bounds="window"
 			className={cn(
+				// Phase 6.5 fix: tagging the annotation Rnd so the primary
+				// layer's Rnd can exclude it from its own drag (cancel
+				// selector). Without this, dragging an annotation also drags
+				// the primary tile underneath.
+				"annotation-overlay-tile",
 				"cursor-move",
 				isSelected &&
 					annotation.type !== "blur" &&

@@ -889,6 +889,26 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			const recordingId = baseRecordingId + index;
 			const sourceLabel = source.name;
 
+			// Phase 7: on Windows, additional layers (index > 0) route
+			// through the Chromium desktopCapturer + getUserMedia +
+			// MediaRecorder path so static GPU-rendered windows (Win11
+			// Notepad, Electron, DirectComposition) are actually captured.
+			// The primary (index 0) keeps WGC because it ships audio +
+			// editable cursor; additional layers are video-only anyway.
+			if (platform === "win32" && index > 0) {
+				return {
+					platform: "display-media",
+					layerId,
+					recordingId,
+					sourceLabel,
+					sourceId: source.id,
+					fileName: `recording-${recordingId}.webm`,
+					fps: TARGET_FRAME_RATE,
+					maxWidth: TARGET_WIDTH,
+					maxHeight: TARGET_HEIGHT,
+				};
+			}
+
 			if (platform === "win32") {
 				const displayId = Number(source.display_id);
 				const sourceType = source.id.startsWith("window:") ? "window" : "display";
