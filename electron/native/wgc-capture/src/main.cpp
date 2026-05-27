@@ -594,7 +594,16 @@ int main(int argc, char* argv[]) {
 #ifndef PW_RENDERFULLCONTENT
 #define PW_RENDERFULLCONTENT 0x00000002
 #endif
-        BOOL printed = PrintWindow(hwnd, memDC, PW_RENDERFULLCONTENT);
+
+        // WS_EX_COMPOSITED hack: temporarily flip on layered/composited
+        // semantics so PrintWindow re-renders the target via the
+        // off-screen path that DWM uses internally. Suggested in the
+        // Chromium graphics-dev discussion as a workaround for GPU-only
+        // windows. Restored immediately after PrintWindow finishes.
+        const LONG_PTR oldExStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, oldExStyle | WS_EX_COMPOSITED);
+        PrintWindow(hwnd, memDC, PW_RENDERFULLCONTENT);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, oldExStyle);
 
         const size_t byteCount = static_cast<size_t>(width) * height * 4;
         auto bufferLooksBlack = [&]() {
@@ -611,27 +620,29 @@ int main(int argc, char* argv[]) {
             return true;
         };
 
-        // Phase 6 fallback: PrintWindow returns an empty buffer for many
-        // GPU-rendered windows (WinUI 3 / Electron / DirectComposition).
-        // When that happens, fall back to BitBlt'ing from the screen DC at
-        // the window's on-screen rect. This only works if the window is
-        // actually visible on screen — if it's covered, the overlapping
-        // window's pixels will be picked up instead — but it lets static
-        // GPU windows be captured at all when no other path works.
-        bool ok = printed ? true : false;
-        if (printed && bufferLooksBlack()) {
+        // BitBlt screen fallback: when PrintWindow comes back empty (either
+        // it returned FALSE or it returned TRUE with an all-zero buffer,
+        // which is the common WinUI 3 / Electron / DirectComposition
+        // failure mode), copy the on-screen pixels at the window's rect.
+        // This is the same workaround WebRTC's CroppingWindowCapturer uses.
+        // Trade-offs: requires the window to be visible on screen; if it's
+        // partially covered the overlapping window's pixels leak through.
+        bool ok = false;
+        if (!bufferLooksBlack()) {
+            ok = true;
+        } else {
             RECT winRect{};
             if (GetWindowRect(hwnd, &winRect)) {
                 const int winW = winRect.right - winRect.left;
                 const int winH = winRect.bottom - winRect.top;
                 if (winW > 0 && winH > 0) {
-                    // Stretch-blit from the on-screen rect into our buffer
-                    // so size mismatches between client area and capture
-                    // size don't matter.
                     SetStretchBltMode(memDC, HALFTONE);
                     StretchBlt(memDC, 0, 0, width, height,
                                screenDC, winRect.left, winRect.top, winW, winH, SRCCOPY);
-                    ok = true;
+                    // Re-check after BitBlt: if the window was covered or
+                    // off-screen the result will still be black, in which
+                    // case there's nothing more we can do at this level.
+                    ok = !bufferLooksBlack();
                 }
             }
         }
