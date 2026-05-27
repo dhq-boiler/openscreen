@@ -8,6 +8,7 @@ import {
 	type TextureSourceLike,
 } from "pixi.js";
 import { MotionBlurFilter } from "pixi-filters/motion-blur";
+import type { LayerTransform } from "@/components/video-editor/projectPersistence";
 import type {
 	AnnotationRegion,
 	CropRegion,
@@ -42,6 +43,7 @@ import {
 	computeFocusFromTransform,
 	computeZoomTransform,
 	createMotionBlurState,
+	type LayerRect,
 	type MotionBlurState,
 } from "@/components/video-editor/videoPlayback/zoomTransform";
 import {
@@ -107,6 +109,13 @@ interface FrameRenderConfig {
 	cursorTelemetry?: import("@/components/video-editor/types").CursorTelemetryPoint[];
 	cursorClickTimestamps?: number[];
 	platform: string;
+	/**
+	 * Phase 5.5: per-layer placements on the stage. When supplied, a
+	 * ZoomRegion with `layerId` interprets focus as layer-local; without
+	 * a matching rect (or when the prop is omitted) focus stays
+	 * stage-normalized — same behavior as v2 single-source exports.
+	 */
+	layerTransforms?: LayerTransform[];
 }
 
 interface AnimationState {
@@ -117,6 +126,12 @@ interface AnimationState {
 	x: number;
 	y: number;
 	appliedScale: number;
+	/**
+	 * Phase 5.5: layerId carried from the active ZoomRegion through to the
+	 * applyZoomTransform call in renderFrame. `undefined` during connected
+	 * transitions because the interpolated focus is already stage-normalized.
+	 */
+	activeLayerId?: string;
 }
 
 interface LayoutCache {
@@ -163,6 +178,7 @@ export class FrameRenderer {
 	private prevAnimationTimeMs: number | null = null;
 	private prevTargetProgress = 0;
 	private isLinux = false;
+	private layerRects: Map<string, LayerRect> | null = null;
 
 	constructor(config: FrameRenderConfig) {
 		this.config = config;
@@ -176,6 +192,17 @@ export class FrameRenderer {
 			y: 0,
 			appliedScale: 1,
 		};
+		if (config.layerTransforms && config.layerTransforms.length > 0) {
+			this.layerRects = new Map();
+			for (const t of config.layerTransforms) {
+				this.layerRects.set(t.layerId, {
+					cx: t.position.cx,
+					cy: t.position.cy,
+					width: t.size.width,
+					height: t.size.height,
+				});
+			}
+		}
 	}
 
 	async initialize(): Promise<void> {
@@ -435,6 +462,8 @@ export class FrameRenderer {
 			motionBlurAmount: this.config.motionBlurAmount ?? 0,
 			motionBlurState: this.motionBlurState,
 			frameTimeMs: timeMs,
+			layerId: this.animationState.activeLayerId,
+			layerRects: this.layerRects ?? undefined,
 		});
 
 		// Render the PixiJS stage to its canvas (video only, transparent background)
@@ -839,6 +868,9 @@ export class FrameRenderer {
 			this.prevTargetProgress = targetProgress;
 
 			if (transition) {
+				// Limitation: see VideoPlayback for details — startFocus and
+				// endFocus get resolved against the *next* region's layer when
+				// connected zooms span different layer targets.
 				const startTransform = computeZoomTransform({
 					stageSize: this.layoutCache.stageSize,
 					baseMask: this.layoutCache.maskRect,
@@ -846,6 +878,8 @@ export class FrameRenderer {
 					zoomProgress: 1,
 					focusX: transition.startFocus.cx,
 					focusY: transition.startFocus.cy,
+					layerId: region?.layerId,
+					layerRects: this.layerRects ?? undefined,
 				});
 				const endTransform = computeZoomTransform({
 					stageSize: this.layoutCache.stageSize,
@@ -854,6 +888,8 @@ export class FrameRenderer {
 					zoomProgress: 1,
 					focusX: transition.endFocus.cx,
 					focusY: transition.endFocus.cy,
+					layerId: region?.layerId,
+					layerRects: this.layerRects ?? undefined,
 				});
 
 				const interpolatedTransform = {
@@ -886,6 +922,10 @@ export class FrameRenderer {
 		state.focusX = targetFocus.cx;
 		state.focusY = targetFocus.cy;
 		state.progress = targetProgress;
+		// During a transition the targetFocus is stage-normalized (recovered
+		// from the interpolated camera transform), so do not re-map it through
+		// the layer rect; outside of transitions, carry the region's layerId.
+		state.activeLayerId = transition ? undefined : region?.layerId;
 
 		const projectedTransform = computeZoomTransform({
 			stageSize: this.layoutCache.stageSize,
@@ -894,6 +934,8 @@ export class FrameRenderer {
 			zoomProgress: state.progress,
 			focusX: state.focusX,
 			focusY: state.focusY,
+			layerId: state.activeLayerId,
+			layerRects: this.layerRects ?? undefined,
 		});
 
 		const appliedScale =

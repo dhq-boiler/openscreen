@@ -96,6 +96,7 @@ import {
 	computeFocusFromTransform,
 	computeZoomTransform,
 	createMotionBlurState,
+	type LayerRect,
 	type MotionBlurState,
 } from "./videoPlayback/zoomTransform";
 
@@ -335,6 +336,8 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		const currentTimeRef = useRef(0);
 		const zoomRegionsRef = useRef<ZoomRegion[]>([]);
 		const cursorTelemetryRef = useRef<CursorTelemetryPoint[]>([]);
+		// Phase 5.5: per-layer rects (stage-normalized) for layer-local zoom focus.
+		const layerRectsRef = useRef<Map<string, LayerRect>>(new Map());
 		const cursorClickTimestampsRef = useRef<number[]>([]);
 		const selectedZoomIdRef = useRef<string | null>(null);
 		const animationStateRef = useRef({
@@ -800,6 +803,19 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		useEffect(() => {
 			zoomRegionsRef.current = zoomRegions;
 		}, [zoomRegions]);
+
+		useEffect(() => {
+			const next = new Map<string, LayerRect>();
+			for (const t of layerTransforms) {
+				next.set(t.layerId, {
+					cx: t.position.cx,
+					cy: t.position.cy,
+					width: t.size.width,
+					height: t.size.height,
+				});
+			}
+			layerRectsRef.current = next;
+		}, [layerTransforms]);
 
 		useEffect(() => {
 			cursorTelemetryRef.current = cursorTelemetry;
@@ -1301,6 +1317,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				targetFocus: ZoomFocus,
 				motionIntensity: number,
 				motionVector: { x: number; y: number },
+				layerId?: string,
 			) => {
 				const cameraContainer = cameraContainerRef.current;
 				if (!cameraContainer) return;
@@ -1324,6 +1341,8 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					transformOverride: transform,
 					motionBlurState: motionBlurStateRef.current,
 					frameTimeMs: performance.now(),
+					layerId,
+					layerRects: layerRectsRef.current,
 				});
 
 				state.x = appliedTransform.x;
@@ -1406,6 +1425,12 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 
 					// Handle connected zoom transitions (pan between adjacent zoom regions)
 					if (transition) {
+						// Limitation: findDominantRegion only carries the next region's
+						// layerId across the transition, so a connected pan that crosses
+						// from a layer-bound zoom into a stage-global zoom (or between
+						// two different layers) interpolates both endpoints against the
+						// next region's layer. Acceptable trade-off given how rare such
+						// mixed-target pairs are in practice.
 						const startTransform = computeZoomTransform({
 							stageSize: stageSizeRef.current,
 							baseMask: baseMaskRef.current,
@@ -1413,6 +1438,8 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 							zoomProgress: 1,
 							focusX: transition.startFocus.cx,
 							focusY: transition.startFocus.cy,
+							layerId: region?.layerId,
+							layerRects: layerRectsRef.current,
 						});
 						const endTransform = computeZoomTransform({
 							stageSize: stageSizeRef.current,
@@ -1421,6 +1448,8 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 							zoomProgress: 1,
 							focusX: transition.endFocus.cx,
 							focusY: transition.endFocus.cy,
+							layerId: region?.layerId,
+							layerRects: layerRectsRef.current,
 						});
 
 						const interpolatedTransform = {
@@ -1453,6 +1482,13 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				state.focusY = targetFocus.cy;
 				state.progress = targetProgress;
 
+				// During a connected transition the targetFocus we already
+				// stored is the *stage-normalized* focus that
+				// computeFocusFromTransform reconstructed from the
+				// interpolated camera transform. Re-mapping it through the
+				// layer rect would double-apply the layer offset, so skip the
+				// layerId here while transition is active.
+				const effectiveLayerId = transition ? undefined : region?.layerId;
 				const projectedTransform = computeZoomTransform({
 					stageSize: stageSizeRef.current,
 					baseMask: baseMaskRef.current,
@@ -1460,6 +1496,8 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					zoomProgress: state.progress,
 					focusX: state.focusX,
 					focusY: state.focusY,
+					layerId: effectiveLayerId,
+					layerRects: layerRectsRef.current,
 				});
 
 				const appliedScale =
@@ -1491,6 +1529,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					targetFocus,
 					motionIntensity,
 					motionVector,
+					effectiveLayerId,
 				);
 
 				const isMotionBlurActive =

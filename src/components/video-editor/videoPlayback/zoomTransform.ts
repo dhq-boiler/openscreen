@@ -47,6 +47,10 @@ interface TransformParams {
 	transformOverride?: AppliedTransform;
 	motionBlurState?: MotionBlurState;
 	frameTimeMs?: number;
+	/** Phase 5.5: target layer for layer-local focus interpretation. */
+	layerId?: string;
+	/** Phase 5.5: per-layer placement on the stage. */
+	layerRects?: ReadonlyMap<string, LayerRect>;
 }
 
 interface AppliedTransform {
@@ -63,6 +67,53 @@ interface FocusFromTransformGeometry {
 	y: number;
 }
 
+/**
+ * Phase 5.5: per-layer focus interpretation.
+ *
+ * A LayerRect describes a single video layer's placement on the editor
+ * stage in stage-normalized units (cx/cy are the layer center, width/
+ * height are the layer size — all in 0..1 of the full stage). When a
+ * ZoomRegion carries a `layerId` and the matching rect is supplied,
+ * `focusX`/`focusY` are interpreted as 0..1 *within that layer*; the
+ * function maps them back into stage-normalized space before computing
+ * the camera transform. Without a layerId (or matching rect), focus is
+ * treated as stage-normalized — i.e. backward compatible with v2 / v3
+ * single-layer projects.
+ */
+export interface LayerRect {
+	cx: number;
+	cy: number;
+	width: number;
+	height: number;
+}
+
+/**
+ * Map a layer-local focus point (cx/cy in 0..1 of the layer) back to
+ * stage-normalized coordinates (0..1 of the full canvas). When no
+ * layerId or matching rect is supplied, returns the input unchanged
+ * (stage-normalized passthrough).
+ */
+export function resolveStageFocus(
+	focusX: number,
+	focusY: number,
+	layerId: string | undefined,
+	layerRects: ReadonlyMap<string, LayerRect> | undefined,
+): { x: number; y: number } {
+	if (!layerId || !layerRects) {
+		return { x: focusX, y: focusY };
+	}
+	const rect = layerRects.get(layerId);
+	if (!rect || rect.width <= 0 || rect.height <= 0) {
+		return { x: focusX, y: focusY };
+	}
+	const left = rect.cx - rect.width / 2;
+	const top = rect.cy - rect.height / 2;
+	return {
+		x: left + focusX * rect.width,
+		y: top + focusY * rect.height,
+	};
+}
+
 interface ZoomTransformGeometry {
 	stageSize: { width: number; height: number };
 	baseMask: { x: number; y: number; width: number; height: number };
@@ -70,6 +121,10 @@ interface ZoomTransformGeometry {
 	zoomProgress?: number;
 	focusX: number;
 	focusY: number;
+	/** Phase 5.5: target layer for layer-local focus interpretation. */
+	layerId?: string;
+	/** Phase 5.5: per-layer placement on the stage. */
+	layerRects?: ReadonlyMap<string, LayerRect>;
 }
 
 export function computeZoomTransform({
@@ -79,6 +134,8 @@ export function computeZoomTransform({
 	zoomProgress = 1,
 	focusX,
 	focusY,
+	layerId,
+	layerRects,
 }: ZoomTransformGeometry): AppliedTransform {
 	if (
 		stageSize.width <= 0 ||
@@ -90,10 +147,11 @@ export function computeZoomTransform({
 	}
 
 	const progress = Math.min(1, Math.max(0, zoomProgress));
+	const stageFocus = resolveStageFocus(focusX, focusY, layerId, layerRects);
 	// Focus coordinates are stage-normalized (0-1 of full canvas),
 	// so map directly to stage pixels, not through baseMask.
-	const focusStagePxX = focusX * stageSize.width;
-	const focusStagePxY = focusY * stageSize.height;
+	const focusStagePxX = stageFocus.x * stageSize.width;
+	const focusStagePxY = stageFocus.y * stageSize.height;
 	const stageCenterX = stageSize.width / 2;
 	const stageCenterY = stageSize.height / 2;
 	const scale = 1 + (zoomScale - 1) * progress;
@@ -152,6 +210,8 @@ export function applyZoomTransform({
 	transformOverride,
 	motionBlurState,
 	frameTimeMs,
+	layerId,
+	layerRects,
 }: TransformParams): AppliedTransform {
 	if (
 		stageSize.width <= 0 ||
@@ -171,6 +231,8 @@ export function applyZoomTransform({
 			zoomProgress,
 			focusX,
 			focusY,
+			layerId,
+			layerRects,
 		});
 
 	// Apply position & scale to camera container
