@@ -32,7 +32,13 @@ import {
 	VideoExporter,
 } from "@/lib/exporter";
 import { computeFrameStepTime } from "@/lib/frameStep";
-import type { CursorCaptureMode, ProjectMedia } from "@/lib/recordingSession";
+import {
+	type CursorCaptureMode,
+	type ProjectMedia,
+	type ProjectMediaV3,
+	primaryScreenVideoPath,
+	type VideoLayer,
+} from "@/lib/recordingSession";
 import { matchesShortcut } from "@/lib/shortcuts";
 import {
 	getExportFolder,
@@ -190,6 +196,11 @@ export default function VideoEditor() {
 	// projects). Each entry is a file:// URL ready for an HTMLVideoElement
 	// `src`. The primary layer continues to flow through `videoPath` so the
 	// rest of the editor (zoom/cursor/etc.) keeps treating it as canonical.
+	// v3 session id pulled from the loaded project (or fresh recording) so that
+	// `createProjectData` can write a stable `mediaV3.sessionId` on save. Stays
+	// null for single-layer (v2) projects; a fallback id is generated on save
+	// only when additional layers exist but no id has been seen yet.
+	const [projectSessionId, setProjectSessionId] = useState<string | null>(null);
 	const [additionalLayerPaths, setAdditionalLayerPaths] = useState<string[]>([]);
 	// Phase 4.5: layer ids matched 1:1 with additionalLayerPaths. Required so
 	// MultiLayerOverlay can resolve which LayerTransform belongs to each tile.
@@ -309,7 +320,7 @@ export default function VideoEditor() {
 		[annotationRegions],
 	);
 
-	const currentProjectMedia = useMemo<ProjectMedia | null>(() => {
+	const currentProjectMedia = useMemo<ProjectMedia | ProjectMediaV3 | null>(() => {
 		const screenVideoPath = videoSourcePath ?? (videoPath ? fromFileUrl(videoPath) : null);
 		if (!screenVideoPath) {
 			return null;
@@ -317,9 +328,47 @@ export default function VideoEditor() {
 
 		const webcamSourcePath =
 			webcamVideoSourcePath ?? (webcamVideoPath ? fromFileUrl(webcamVideoPath) : null);
+
+		// Single-layer (v2) projects keep their on-disk shape so existing test
+		// fixtures and any external tools that only know about `media` still
+		// round-trip cleanly.
+		if (additionalLayerPaths.length === 0) {
+			return {
+				screenVideoPath,
+				...(webcamSourcePath ? { webcamVideoPath: webcamSourcePath } : {}),
+				...(recordingCursorCaptureMode ? { cursorCaptureMode: recordingCursorCaptureMode } : {}),
+			};
+		}
+
+		// Multi-source recordings need to round-trip every layer's file path.
+		// Previously `currentProjectMedia` was hard-coded to v2 and dropped Layer
+		// 2+ on save, so re-opening the project came back as a single-layer
+		// session. Build a v3 media so `createProjectData` writes a `mediaV3`
+		// block alongside the v2 shadow.
+		const primaryLayerId =
+			availableLayers[0]?.id ?? `layer-${Math.random().toString(36).slice(2, 10)}`;
+		const layers: VideoLayer[] = [
+			{
+				id: primaryLayerId,
+				kind: "screen",
+				screenVideoPath,
+			},
+			...additionalLayerPaths.map((url, idx) => ({
+				id: additionalLayerIds[idx] ?? `layer-${Math.random().toString(36).slice(2, 10)}`,
+				kind: "screen" as const,
+				screenVideoPath: fromFileUrl(url),
+			})),
+		];
+
+		const fallbackSessionId = `session-${Date.now().toString(36)}-${Math.random()
+			.toString(36)
+			.slice(2, 6)}`;
+
 		return {
-			screenVideoPath,
-			...(webcamSourcePath ? { webcamVideoPath: webcamSourcePath } : {}),
+			schemaVersion: 3,
+			sessionId: projectSessionId ?? fallbackSessionId,
+			layers,
+			...(webcamSourcePath ? { webcam: { webcamVideoPath: webcamSourcePath } } : {}),
 			...(recordingCursorCaptureMode ? { cursorCaptureMode: recordingCursorCaptureMode } : {}),
 		};
 	}, [
@@ -328,6 +377,10 @@ export default function VideoEditor() {
 		webcamVideoPath,
 		webcamVideoSourcePath,
 		recordingCursorCaptureMode,
+		additionalLayerPaths,
+		additionalLayerIds,
+		availableLayers,
+		projectSessionId,
 	]);
 
 	const applyLoadedProject = useCallback(
@@ -388,6 +441,7 @@ export default function VideoEditor() {
 			setAdditionalLayerPaths(extraLayerPaths);
 			setAdditionalLayerIds(extraLayerIds);
 			setAvailableLayers(layerRoster);
+			setProjectSessionId(projectMediaV3?.sessionId ?? null);
 			const normalizedEditor = normalizeProjectEditor(project.editor);
 			// Phase 4.5: synthesize default transforms when v3 media has no
 			// persisted layerTransforms yet. Keeps the editor authoritative
@@ -685,12 +739,20 @@ export default function VideoEditor() {
 				gifFrameRate,
 				gifLoop,
 				gifSizePreset,
+				// Phase 11 follow-up: persist per-layer placements so reopening a
+				// multi-source project restores Layer 2/3 to where the user
+				// arranged them. Previously the save dropped layerTransforms and
+				// the loader fell back to a freshly synthesized default layout.
+				layerTransforms,
 			};
 			const projectData = createProjectData(currentProjectMedia, editorState);
 
+			// currentProjectMedia is v2 (`screenVideoPath`) or v3 (`layers[0]`).
+			// Use the helper so the filename derivation works for both.
+			const primaryPath = primaryScreenVideoPath(currentProjectMedia);
 			const fileNameBase =
-				currentProjectMedia.screenVideoPath
-					.split(/[\\/]/)
+				primaryPath
+					?.split(/[\\/]/)
 					.pop()
 					?.replace(/\.[^.]+$/, "") || `project-${Date.now()}`;
 			// Match the normalization path used by `currentProjectSnapshot` so the
@@ -746,6 +808,7 @@ export default function VideoEditor() {
 			videoPath,
 			t,
 			webcamSizePreset,
+			layerTransforms,
 		],
 	);
 
