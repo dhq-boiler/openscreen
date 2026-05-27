@@ -1,9 +1,10 @@
 import type { Span } from "dnd-timeline";
-import { useItem } from "dnd-timeline";
+import { useItem, useTimelineContext } from "dnd-timeline";
 import { Gauge, MessageSquare, MousePointer2, Scissors, ZoomIn } from "lucide-react";
 import { useMemo } from "react";
 import { useScopedT } from "@/contexts/I18nContext";
 import { cn } from "@/lib/utils";
+import { TRANSITION_WINDOW_MS, ZOOM_IN_LEAD_DURATION_MS } from "../videoPlayback/constants";
 import glassStyles from "./ItemGlass.module.css";
 
 interface ItemProps {
@@ -59,10 +60,19 @@ export default function Item({
 		span,
 		data: { rowId },
 	});
+	const { valueToPixels } = useTimelineContext();
 
 	const isZoom = variant === "zoom";
 	const isTrim = variant === "trim";
 	const isSpeed = variant === "speed";
+
+	// Yellow "transitioning" strips bracket the green zoom item, marking
+	// the time windows during which the zoom is ramping in / out. Widths
+	// are constants from the zoom playback math, mapped to pixels via the
+	// timeline's current scale so they stay accurate when the user zooms
+	// the timeline itself.
+	const transInPx = isZoom ? Math.max(0, valueToPixels(ZOOM_IN_LEAD_DURATION_MS)) : 0;
+	const transOutPx = isZoom ? Math.max(0, valueToPixels(TRANSITION_WINDOW_MS)) : 0;
 
 	const glassClass = isZoom
 		? glassStyles.glassGreen
@@ -94,6 +104,20 @@ export default function Item({
 			onPointerDownCapture={() => onSelect?.()}
 			className="group"
 		>
+			{isZoom && transInPx > 0 && (
+				<div
+					className={cn(glassStyles.transitionStrip, glassStyles.left)}
+					style={{ left: -transInPx, width: transInPx }}
+					aria-hidden="true"
+				/>
+			)}
+			{isZoom && transOutPx > 0 && (
+				<div
+					className={cn(glassStyles.transitionStrip, glassStyles.right)}
+					style={{ left: "100%", width: transOutPx }}
+					aria-hidden="true"
+				/>
+			)}
 			<div style={{ ...itemContentStyle, minWidth: 24 }}>
 				<div
 					className={cn(

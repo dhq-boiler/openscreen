@@ -110,6 +110,28 @@
 	z-index: 10;
 }
 
+.transitionStrip {
+	position: absolute;
+	top: 3px;
+	bottom: 3px;
+	border-radius: 6px;
+	background: linear-gradient(180deg, rgba(250, 204, 21, 0.32), rgba(202, 138, 4, 0.22));
+	border: 1px solid rgba(250, 204, 21, 0.45);
+	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+	pointer-events: none;
+	z-index: 0;
+}
+
+.transitionStrip.left {
+	border-top-right-radius: 0;
+	border-bottom-right-radius: 0;
+}
+
+.transitionStrip.right {
+	border-top-left-radius: 0;
+	border-bottom-left-radius: 0;
+}
+
 .zoomEndCap {
 	position: absolute;
 	top: 0;
