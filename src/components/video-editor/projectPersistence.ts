@@ -1,7 +1,7 @@
 import { normalizeBlurColor, normalizeBlurType } from "@/lib/blurEffects";
 import type { ExportFormat, ExportQuality, GifFrameRate, GifSizePreset } from "@/lib/exporter";
-import type { ProjectMedia } from "@/lib/recordingSession";
-import { normalizeProjectMedia } from "@/lib/recordingSession";
+import type { ProjectMedia, ProjectMediaV3 } from "@/lib/recordingSession";
+import { normalizeProjectMedia, toProjectMediaV3 } from "@/lib/recordingSession";
 import { DEFAULT_WALLPAPER, WALLPAPER_PATHS } from "@/lib/wallpaper";
 import { ASPECT_RATIOS, type AspectRatio, isPortraitAspectRatio } from "@/utils/aspectRatioUtils";
 import {
@@ -59,7 +59,22 @@ function normalizeWallpaperValue(value: string): string {
 	return CANONICAL_WALLPAPERS.has(canonical) ? canonical : DEFAULT_WALLPAPER;
 }
 
-export const PROJECT_VERSION = 2;
+export const PROJECT_VERSION = 3;
+
+/**
+ * Per-layer placement on the editor's virtual desktop. Introduced in v3.
+ * Single-layer v2 projects migrate to a single LayerTransform that occupies
+ * the full stage (cx=0.5, cy=0.5, width=1, height=1, zOrder=0).
+ */
+export interface LayerTransform {
+	layerId: string;
+	position: { cx: number; cy: number };
+	size: { width: number; height: number };
+	rotation: number;
+	zOrder: number;
+	visible: boolean;
+	cornerRadius?: number;
+}
 
 export interface ProjectEditorState {
 	wallpaper: string;
@@ -83,12 +98,22 @@ export interface ProjectEditorState {
 	gifFrameRate: GifFrameRate;
 	gifLoop: boolean;
 	gifSizePreset: GifSizePreset;
+	/**
+	 * Per-layer transforms. Optional on disk for backward compatibility —
+	 * when absent the loader synthesizes a single full-stage transform per
+	 * layer. Phase 4 will populate this from user drag/resize input.
+	 */
+	layerTransforms?: LayerTransform[];
 }
 
 export interface EditorProjectData {
 	version: number;
+	/** v2 single-source media (kept for backward compat on save+load). */
 	media?: ProjectMedia;
+	/** v3 multi-layer media. When present, takes precedence over `media`. */
+	mediaV3?: ProjectMediaV3;
 	editor: ProjectEditorState;
+	/** Pre-v2 legacy field. Still loaded; new projects do not write it. */
 	videoPath?: string;
 }
 
@@ -188,7 +213,7 @@ export function validateProjectData(candidate: unknown): candidate is EditorProj
 	if (!candidate || typeof candidate !== "object") return false;
 	const project = candidate as Partial<EditorProjectData>;
 	if (typeof project.version !== "number") return false;
-	if (!resolveProjectMedia(project)) return false;
+	if (!resolveProjectMediaV3(project)) return false;
 	if (!project.editor || typeof project.editor !== "object") return false;
 	return true;
 }
@@ -204,6 +229,24 @@ export function resolveProjectMedia(
 	if (typeof candidate.videoPath === "string" && candidate.videoPath.trim()) {
 		return { screenVideoPath: candidate.videoPath };
 	}
+
+	return null;
+}
+
+/**
+ * Resolve a project's media into the unified v3 shape regardless of which
+ * version it was saved as. Precedence: mediaV3 → media → videoPath.
+ */
+export function resolveProjectMediaV3(
+	candidate:
+		| Partial<EditorProjectData>
+		| { mediaV3?: unknown; media?: unknown; videoPath?: unknown },
+): ProjectMediaV3 | null {
+	const v3 = toProjectMediaV3((candidate as { mediaV3?: unknown }).mediaV3);
+	if (v3) return v3;
+
+	const v2 = resolveProjectMedia(candidate as Partial<EditorProjectData>);
+	if (v2) return toProjectMediaV3(v2);
 
 	return null;
 }
@@ -502,22 +545,95 @@ export function normalizeProjectEditor(editor: Partial<ProjectEditorState>): Pro
 			editor.gifSizePreset === "original"
 				? editor.gifSizePreset
 				: DEFAULT_GIF_SETTINGS.sizePreset,
+		...(Array.isArray(editor.layerTransforms)
+			? { layerTransforms: normalizeLayerTransforms(editor.layerTransforms) }
+			: {}),
 	};
 }
 
+function normalizeLayerTransforms(raw: unknown[]): LayerTransform[] {
+	return raw
+		.filter((entry): entry is Partial<LayerTransform> & { layerId: string } =>
+			Boolean(
+				entry &&
+					typeof entry === "object" &&
+					typeof (entry as { layerId?: unknown }).layerId === "string",
+			),
+		)
+		.map((entry) => ({
+			layerId: entry.layerId,
+			position: {
+				cx: clamp(isFiniteNumber(entry.position?.cx) ? entry.position.cx : 0.5, 0, 1),
+				cy: clamp(isFiniteNumber(entry.position?.cy) ? entry.position.cy : 0.5, 0, 1),
+			},
+			size: {
+				width: clamp(isFiniteNumber(entry.size?.width) ? entry.size.width : 1, 0.05, 1),
+				height: clamp(isFiniteNumber(entry.size?.height) ? entry.size.height : 1, 0.05, 1),
+			},
+			rotation: isFiniteNumber(entry.rotation) ? entry.rotation : 0,
+			zOrder: isFiniteNumber(entry.zOrder) ? entry.zOrder : 0,
+			visible: typeof entry.visible === "boolean" ? entry.visible : true,
+			...(isFiniteNumber(entry.cornerRadius)
+				? { cornerRadius: Math.max(0, entry.cornerRadius) }
+				: {}),
+		}));
+}
+
+/**
+ * Build default LayerTransforms for a v3 media that has none persisted yet.
+ * Each layer gets a full-stage transform stacked by index. Used both for
+ * the v2→v3 migration and as a fallback when loading projects whose
+ * editor state predates v3.
+ */
+export function defaultLayerTransformsForMedia(media: ProjectMediaV3): LayerTransform[] {
+	return media.layers.map((layer, index) => ({
+		layerId: layer.id,
+		position: { cx: 0.5, cy: 0.5 },
+		size: { width: 1, height: 1 },
+		rotation: 0,
+		zOrder: index,
+		visible: true,
+	}));
+}
+
 export function createProjectData(
-	media: ProjectMedia,
+	media: ProjectMedia | ProjectMediaV3,
 	editor: ProjectEditorState,
 ): EditorProjectData {
+	// Preserve the caller's media shape on disk so that snapshots are
+	// deterministic: v2 input writes only `media`, v3 input writes
+	// `mediaV3` plus a v2 `media` shadow pointing at the primary layer
+	// (so old builds and external tools can still open single-layer
+	// projects). Migration v2→v3 happens on LOAD via resolveProjectMediaV3.
+	const isV3 = (media as ProjectMediaV3).schemaVersion === 3;
+	if (!isV3) {
+		return {
+			version: PROJECT_VERSION,
+			media: media as ProjectMedia,
+			editor,
+		};
+	}
+
+	const v3 = media as ProjectMediaV3;
+	const primaryLayer = v3.layers[0];
+	const v2Shadow: ProjectMedia | undefined = primaryLayer
+		? {
+				screenVideoPath: primaryLayer.screenVideoPath,
+				...(v3.webcam ? { webcamVideoPath: v3.webcam.webcamVideoPath } : {}),
+				...(v3.cursorCaptureMode ? { cursorCaptureMode: v3.cursorCaptureMode } : {}),
+			}
+		: undefined;
+
 	return {
 		version: PROJECT_VERSION,
-		media,
+		...(v2Shadow ? { media: v2Shadow } : {}),
+		mediaV3: v3,
 		editor,
 	};
 }
 
 export function createProjectSnapshot(
-	media: ProjectMedia,
+	media: ProjectMedia | ProjectMediaV3,
 	editor: Partial<ProjectEditorState>,
 ): string {
 	return JSON.stringify(createProjectData(media, normalizeProjectEditor(editor)));
