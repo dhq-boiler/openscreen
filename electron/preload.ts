@@ -84,26 +84,30 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	startNativeWindowsRecording: (request: NativeWindowsRecordingRequest) => {
 		return ipcRenderer.invoke("start-native-windows-recording", request);
 	},
-	stopNativeWindowsRecording: (discard?: boolean) => {
-		return ipcRenderer.invoke("stop-native-windows-recording", discard);
+	stopNativeWindowsRecording: (
+		discardOrOptions?: boolean | { discard?: boolean; recordingId?: number },
+	) => {
+		return ipcRenderer.invoke("stop-native-windows-recording", discardOrOptions);
 	},
-	pauseNativeWindowsRecording: () => {
-		return ipcRenderer.invoke("pause-native-windows-recording");
+	pauseNativeWindowsRecording: (recordingId?: number) => {
+		return ipcRenderer.invoke("pause-native-windows-recording", recordingId);
 	},
-	resumeNativeWindowsRecording: () => {
-		return ipcRenderer.invoke("resume-native-windows-recording");
+	resumeNativeWindowsRecording: (recordingId?: number) => {
+		return ipcRenderer.invoke("resume-native-windows-recording", recordingId);
 	},
 	startNativeMacRecording: (request: NativeMacRecordingRequest) => {
 		return ipcRenderer.invoke("start-native-mac-recording", request);
 	},
-	pauseNativeMacRecording: () => {
-		return ipcRenderer.invoke("pause-native-mac-recording");
+	pauseNativeMacRecording: (recordingId?: number) => {
+		return ipcRenderer.invoke("pause-native-mac-recording", recordingId);
 	},
-	resumeNativeMacRecording: () => {
-		return ipcRenderer.invoke("resume-native-mac-recording");
+	resumeNativeMacRecording: (recordingId?: number) => {
+		return ipcRenderer.invoke("resume-native-mac-recording", recordingId);
 	},
-	stopNativeMacRecording: (discard?: boolean) => {
-		return ipcRenderer.invoke("stop-native-mac-recording", discard);
+	stopNativeMacRecording: (
+		discardOrOptions?: boolean | { discard?: boolean; recordingId?: number },
+	) => {
+		return ipcRenderer.invoke("stop-native-mac-recording", discardOrOptions);
 	},
 	attachNativeMacWebcamRecording: (payload: {
 		screenVideoPath: string;

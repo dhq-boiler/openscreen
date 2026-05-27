@@ -109,7 +109,9 @@ interface Window {
 		startNativeWindowsRecording: (
 			request: import("../src/lib/nativeWindowsRecording").NativeWindowsRecordingRequest,
 		) => Promise<import("../src/lib/nativeWindowsRecording").NativeWindowsRecordingStartResult>;
-		stopNativeWindowsRecording: (discard?: boolean) => Promise<{
+		stopNativeWindowsRecording: (
+			discardOrOptions?: boolean | { discard?: boolean; recordingId?: number },
+		) => Promise<{
 			success: boolean;
 			path?: string;
 			session?: import("../src/lib/recordingSession").RecordingSession;
@@ -117,26 +119,28 @@ interface Window {
 			discarded?: boolean;
 			error?: string;
 		}>;
-		pauseNativeWindowsRecording: () => Promise<{
+		pauseNativeWindowsRecording: (recordingId?: number) => Promise<{
 			success: boolean;
 			error?: string;
 		}>;
-		resumeNativeWindowsRecording: () => Promise<{
+		resumeNativeWindowsRecording: (recordingId?: number) => Promise<{
 			success: boolean;
 			error?: string;
 		}>;
 		startNativeMacRecording: (
 			request: import("../src/lib/nativeMacRecording").NativeMacRecordingRequest,
 		) => Promise<import("../src/lib/nativeMacRecording").NativeMacRecordingStartResult>;
-		pauseNativeMacRecording: () => Promise<{
+		pauseNativeMacRecording: (recordingId?: number) => Promise<{
 			success: boolean;
 			error?: string;
 		}>;
-		resumeNativeMacRecording: () => Promise<{
+		resumeNativeMacRecording: (recordingId?: number) => Promise<{
 			success: boolean;
 			error?: string;
 		}>;
-		stopNativeMacRecording: (discard?: boolean) => Promise<{
+		stopNativeMacRecording: (
+			discardOrOptions?: boolean | { discard?: boolean; recordingId?: number },
+		) => Promise<{
 			success: boolean;
 			path?: string;
 			session?: import("../src/lib/recordingSession").RecordingSession;
