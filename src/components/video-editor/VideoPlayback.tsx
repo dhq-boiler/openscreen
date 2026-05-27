@@ -71,6 +71,11 @@ import {
 	type ZoomRegion,
 } from "./types";
 import {
+	type ComposeStageLayer,
+	composeStageCanvas,
+	getPixiCanvas,
+} from "./videoPlayback/composeStageCanvas";
+import {
 	AUTO_FOLLOW_RAMP_DISTANCE,
 	AUTO_FOLLOW_SMOOTHING_FACTOR,
 	AUTO_FOLLOW_SMOOTHING_FACTOR_MAX,
@@ -2310,16 +2315,65 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 										region: blurRegion,
 									})),
 								].sort((a, b) => a.region.zIndex - b.region.zIndex);
+								// Phase 11 Step 3: composite every layer (Layer 1 PixiJS
+								// canvas + Layer 2/3 <video> tiles) into a single stage-
+								// sized canvas. The previous source was only the PixiJS
+								// extract of `app.stage`, which is Layer 1 alone — anything
+								// placed on Layer 2/3 sampled out-of-bounds and rendered
+								// transparent. composeStageCanvas mirrors the on-screen
+								// stacking so AnnotationOverlay's existing sampling math
+								// (scaleX = sourceWidth / sourceClientWidth) keeps working.
 								const previewSnapshotCanvas =
 									filteredBlurRegions.length > 0
 										? (() => {
-												const app = appRef.current;
-												if (!app?.renderer?.extract) return null;
-												try {
-													return app.renderer.extract.canvas(app.stage);
-												} catch {
-													return null;
+												const pixiCanvas = getPixiCanvas(appRef.current);
+												const stageEl = stageContentRef.current;
+												if (!pixiCanvas && !stageEl) return null;
+
+												const layers: ComposeStageLayer[] = [];
+
+												if (pixiCanvas) {
+													layers.push({
+														layerId: primaryLayerId ?? "primary",
+														zOrder: primaryTransform?.zOrder ?? 0,
+														rect: {
+															x: enablePrimaryTile ? primaryStageXPx : 0,
+															y: enablePrimaryTile ? primaryStageYPx : 0,
+															width: enablePrimaryTile ? primaryStageWidthPx : stagePxWidth,
+															height: enablePrimaryTile ? primaryStageHeightPx : stagePxHeight,
+														},
+														source: { kind: "pixi", canvas: pixiCanvas },
+													});
 												}
+
+												if (stageEl) {
+													const videoEls = stageEl.querySelectorAll<HTMLVideoElement>(
+														"video[data-layer-video-id]",
+													);
+													videoEls.forEach((v) => {
+														const id = v.dataset.layerVideoId;
+														if (!id) return;
+														const t = layerTransforms.find((lt) => lt.layerId === id);
+														if (!t) return;
+														if (t.visible === false) return;
+														const widthPx = Math.max(60, t.size.width * stagePxWidth);
+														const heightPx = Math.max(40, t.size.height * stagePxHeight);
+														const xPx = t.position.cx * stagePxWidth - widthPx / 2;
+														const yPx = t.position.cy * stagePxHeight - heightPx / 2;
+														layers.push({
+															layerId: id,
+															zOrder: t.zOrder,
+															rect: { x: xPx, y: yPx, width: widthPx, height: heightPx },
+															source: { kind: "video", video: v },
+														});
+													});
+												}
+
+												return composeStageCanvas({
+													stageWidth: stagePxWidth,
+													stageHeight: stagePxHeight,
+													layers,
+												});
 											})()
 										: null;
 
@@ -2605,6 +2659,10 @@ function MultiLayerOverlay({
 							preload="auto"
 							className="h-full w-full object-cover pointer-events-none select-none"
 							draggable={false}
+							// Phase 11 Step 3: composeStageCanvas reads Layer 2/3
+							// video frames via this data attribute so the blur
+							// sampling source contains every visible layer.
+							data-layer-video-id={layerId ?? ""}
 							onLoadedMetadata={(e) => {
 								const v = e.currentTarget;
 								if (v.videoWidth <= 0 || v.videoHeight <= 0) return;

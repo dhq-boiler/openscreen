@@ -1,3 +1,4 @@
+export * from "./composeStageCanvas";
 export * from "./constants";
 export * from "./focusUtils";
 export * from "./layoutUtils";
