@@ -377,28 +377,64 @@ const MAX_CURSOR_SAMPLES = 60 * 60 * 30; // 1 hour @ 30Hz
 
 let cursorRecordingSession: CursorRecordingSession | null = null;
 let pendingCursorRecordingData: CursorRecordingData | null = null;
-let nativeWindowsCaptureProcess: ChildProcessWithoutNullStreams | null = null;
-let nativeWindowsCaptureOutput = "";
-let nativeWindowsCaptureTargetPath: string | null = null;
-let nativeWindowsCaptureWebcamTargetPath: string | null = null;
-let nativeWindowsCaptureRecordingId: number | null = null;
-let nativeWindowsCursorOffsetMs = 0;
-let nativeWindowsCursorCaptureMode: CursorCaptureMode = "editable-overlay";
-let nativeWindowsCursorRecordingStartMs = 0;
-let nativeWindowsPauseStartedAtMs: number | null = null;
-let nativeWindowsPauseRanges: Array<{ startMs: number; endMs: number }> = [];
-let nativeWindowsIsPaused = false;
+
+// Per-session state for native recordings. Each entry corresponds to one
+// helper process. Keyed by recordingId (the same id the helper writes into
+// its output filename). The single-source UI still produces only one entry
+// at a time; Phase 2 expands this to multiple parallel sessions.
+interface NativeWindowsCaptureSession {
+	recordingId: number;
+	process: ChildProcessWithoutNullStreams;
+	output: string;
+	targetPath: string;
+	webcamTargetPath: string | null;
+	cursorOffsetMs: number;
+	cursorCaptureMode: CursorCaptureMode;
+	cursorRecordingStartMs: number;
+	pauseStartedAtMs: number | null;
+	pauseRanges: Array<{ startMs: number; endMs: number }>;
+	isPaused: boolean;
+}
+
+interface NativeMacCaptureSession {
+	recordingId: number;
+	process: ChildProcessWithoutNullStreams;
+	output: string;
+	targetPath: string;
+	cursorOffsetMs: number;
+	cursorCaptureMode: CursorCaptureMode;
+	cursorRecordingStartMs: number;
+	pauseStartedAtMs: number | null;
+	pauseRanges: Array<{ startMs: number; endMs: number }>;
+	isPaused: boolean;
+}
+
+const nativeWindowsCaptures = new Map<number, NativeWindowsCaptureSession>();
+const nativeMacCaptures = new Map<number, NativeMacCaptureSession>();
+
 const NATIVE_WINDOWS_CAPTURE_STOP_TIMEOUT_MS = 15_000;
-let nativeMacCaptureProcess: ChildProcessWithoutNullStreams | null = null;
-let nativeMacCaptureOutput = "";
-let nativeMacCaptureTargetPath: string | null = null;
-let nativeMacCaptureRecordingId: number | null = null;
-let nativeMacCursorOffsetMs = 0;
-let nativeMacCursorCaptureMode: CursorCaptureMode = "editable-overlay";
-let nativeMacCursorRecordingStartMs = 0;
-let nativeMacPauseStartedAtMs: number | null = null;
-let nativeMacPauseRanges: Array<{ startMs: number; endMs: number }> = [];
-let nativeMacIsPaused = false;
+
+function getOnlyActiveWindowsCapture(): NativeWindowsCaptureSession | null {
+	if (nativeWindowsCaptures.size === 0) return null;
+	if (nativeWindowsCaptures.size === 1) {
+		return nativeWindowsCaptures.values().next().value ?? null;
+	}
+	throw new Error(
+		`Expected at most one active Windows capture session, found ${nativeWindowsCaptures.size}. ` +
+			"Multi-session support requires the caller to pass an explicit recordingId.",
+	);
+}
+
+function getOnlyActiveMacCapture(): NativeMacCaptureSession | null {
+	if (nativeMacCaptures.size === 0) return null;
+	if (nativeMacCaptures.size === 1) {
+		return nativeMacCaptures.values().next().value ?? null;
+	}
+	throw new Error(
+		`Expected at most one active macOS capture session, found ${nativeMacCaptures.size}. ` +
+			"Multi-session support requires the caller to pass an explicit recordingId.",
+	);
+}
 
 function normalizeCursorSample(sample: unknown): CursorRecordingSample | null {
 	if (!sample || typeof sample !== "object") {
@@ -865,31 +901,35 @@ function compactPendingCursorTelemetryPauseRanges(
 	};
 }
 
-function completeNativeMacCursorPauseRange(endMs = Date.now()) {
-	if (nativeMacPauseStartedAtMs === null || nativeMacCursorRecordingStartMs <= 0) {
+function completeNativeMacCursorPauseRange(session: NativeMacCaptureSession, endMs = Date.now()) {
+	if (session.pauseStartedAtMs === null || session.cursorRecordingStartMs <= 0) {
 		return;
 	}
 
-	nativeMacPauseRanges.push({
-		startMs: Math.max(0, nativeMacPauseStartedAtMs - nativeMacCursorRecordingStartMs),
-		endMs: Math.max(0, endMs - nativeMacCursorRecordingStartMs),
+	session.pauseRanges.push({
+		startMs: Math.max(0, session.pauseStartedAtMs - session.cursorRecordingStartMs),
+		endMs: Math.max(0, endMs - session.cursorRecordingStartMs),
 	});
-	nativeMacPauseStartedAtMs = null;
+	session.pauseStartedAtMs = null;
 }
 
-function completeNativeWindowsCursorPauseRange(endMs = Date.now()) {
-	if (nativeWindowsPauseStartedAtMs === null || nativeWindowsCursorRecordingStartMs <= 0) {
+function completeNativeWindowsCursorPauseRange(
+	session: NativeWindowsCaptureSession,
+	endMs = Date.now(),
+) {
+	if (session.pauseStartedAtMs === null || session.cursorRecordingStartMs <= 0) {
 		return;
 	}
 
-	nativeWindowsPauseRanges.push({
-		startMs: Math.max(0, nativeWindowsPauseStartedAtMs - nativeWindowsCursorRecordingStartMs),
-		endMs: Math.max(0, endMs - nativeWindowsCursorRecordingStartMs),
+	session.pauseRanges.push({
+		startMs: Math.max(0, session.pauseStartedAtMs - session.cursorRecordingStartMs),
+		endMs: Math.max(0, endMs - session.cursorRecordingStartMs),
 	});
-	nativeWindowsPauseStartedAtMs = null;
+	session.pauseStartedAtMs = null;
 }
 
-function waitForNativeWindowsCaptureStart(proc: ChildProcessWithoutNullStreams) {
+function waitForNativeWindowsCaptureStart(session: NativeWindowsCaptureSession) {
+	const proc = session.process;
 	return new Promise<void>((resolve, reject) => {
 		const timer = setTimeout(() => {
 			cleanup();
@@ -897,8 +937,8 @@ function waitForNativeWindowsCaptureStart(proc: ChildProcessWithoutNullStreams) 
 		}, 12000);
 
 		const onOutput = (chunk: Buffer) => {
-			nativeWindowsCaptureOutput += chunk.toString();
-			if (nativeWindowsCaptureOutput.includes("Recording started")) {
+			session.output += chunk.toString();
+			if (session.output.includes("Recording started")) {
 				cleanup();
 				resolve();
 			}
@@ -911,7 +951,7 @@ function waitForNativeWindowsCaptureStart(proc: ChildProcessWithoutNullStreams) 
 			cleanup();
 			reject(
 				new Error(
-					nativeWindowsCaptureOutput.trim() ||
+					session.output.trim() ||
 						`Native Windows capture exited before recording started (code=${code ?? "unknown"})`,
 				),
 			);
@@ -931,7 +971,8 @@ function waitForNativeWindowsCaptureStart(proc: ChildProcessWithoutNullStreams) 
 	});
 }
 
-function waitForNativeWindowsCaptureStop(proc: ChildProcessWithoutNullStreams) {
+function waitForNativeWindowsCaptureStop(session: NativeWindowsCaptureSession) {
+	const proc = session.process;
 	return new Promise<string>((resolve, reject) => {
 		const timer = setTimeout(() => {
 			cleanup();
@@ -941,29 +982,28 @@ function waitForNativeWindowsCaptureStop(proc: ChildProcessWithoutNullStreams) {
 			reject(
 				new Error(
 					`Timed out waiting for native Windows capture to stop. Output path: ${
-						nativeWindowsCaptureTargetPath ?? "unknown"
-					}. Output: ${nativeWindowsCaptureOutput.trim()}`,
+						session.targetPath ?? "unknown"
+					}. Output: ${session.output.trim()}`,
 				),
 			);
 		}, NATIVE_WINDOWS_CAPTURE_STOP_TIMEOUT_MS);
 		const onOutput = (chunk: Buffer) => {
-			nativeWindowsCaptureOutput += chunk.toString();
+			session.output += chunk.toString();
 		};
 		const onClose = (code: number | null) => {
 			cleanup();
-			const match = nativeWindowsCaptureOutput.match(/Recording stopped\. Output path: (.+)/);
+			const match = session.output.match(/Recording stopped\. Output path: (.+)/);
 			if (match?.[1]) {
 				resolve(match[1].trim());
 				return;
 			}
-			if (code === 0 && nativeWindowsCaptureTargetPath) {
-				resolve(nativeWindowsCaptureTargetPath);
+			if (code === 0 && session.targetPath) {
+				resolve(session.targetPath);
 				return;
 			}
 			reject(
 				new Error(
-					nativeWindowsCaptureOutput.trim() ||
-						`Native Windows capture exited with code=${code ?? "unknown"}`,
+					session.output.trim() || `Native Windows capture exited with code=${code ?? "unknown"}`,
 				),
 			);
 		};
@@ -1014,8 +1054,8 @@ function tryParseNativeHelperEvent(line: string) {
 	}
 }
 
-function inspectNativeMacCaptureOutput() {
-	for (const line of nativeMacCaptureOutput.split(/\r?\n/)) {
+function inspectNativeMacCaptureOutput(session: NativeMacCaptureSession) {
+	for (const line of session.output.split(/\r?\n/)) {
 		const event = tryParseNativeHelperEvent(line.trim());
 		if (event) {
 			nativeMacCaptureEvents.emit("helper-event", event);
@@ -1023,11 +1063,12 @@ function inspectNativeMacCaptureOutput() {
 	}
 }
 
-function attachNativeMacCaptureOutputDrain(proc: ChildProcessWithoutNullStreams) {
+function attachNativeMacCaptureOutputDrain(session: NativeMacCaptureSession) {
+	const proc = session.process;
 	let lineBuffer = "";
 	const drain = (chunk: Buffer) => {
 		const text = chunk.toString();
-		nativeMacCaptureOutput += text;
+		session.output += text;
 		lineBuffer += text;
 		const lines = lineBuffer.split(/\r?\n/);
 		lineBuffer = lines.pop() ?? "";
@@ -1051,7 +1092,8 @@ function attachNativeMacCaptureOutputDrain(proc: ChildProcessWithoutNullStreams)
 	proc.once("error", cleanup);
 }
 
-function waitForNativeMacCaptureStart(proc: ChildProcessWithoutNullStreams) {
+function waitForNativeMacCaptureStart(session: NativeMacCaptureSession) {
+	const proc = session.process;
 	return new Promise<void>((resolve, reject) => {
 		const timer = setTimeout(() => {
 			cleanup();
@@ -1075,7 +1117,7 @@ function waitForNativeMacCaptureStart(proc: ChildProcessWithoutNullStreams) {
 			cleanup();
 			reject(
 				new Error(
-					nativeMacCaptureOutput.trim() ||
+					session.output.trim() ||
 						`Native macOS capture exited before recording started (code=${code ?? "unknown"})`,
 				),
 			);
@@ -1094,19 +1136,20 @@ function waitForNativeMacCaptureStart(proc: ChildProcessWithoutNullStreams) {
 		nativeMacCaptureEvents.on("helper-event", onOutput);
 		proc.once("close", onClose);
 		proc.once("error", onError);
-		inspectNativeMacCaptureOutput();
+		inspectNativeMacCaptureOutput(session);
 	});
 }
 
-function waitForNativeMacCaptureStop(proc: ChildProcessWithoutNullStreams) {
+function waitForNativeMacCaptureStop(session: NativeMacCaptureSession) {
+	const proc = session.process;
 	return new Promise<string>((resolve, reject) => {
 		const timer = setTimeout(() => {
 			cleanup();
 			reject(
 				new Error(
 					`Timed out waiting for native macOS capture to stop. Output path: ${
-						nativeMacCaptureTargetPath ?? "unknown"
-					}. Output: ${nativeMacCaptureOutput.trim()}`,
+						session.targetPath ?? "unknown"
+					}. Output: ${session.output.trim()}`,
 				),
 			);
 		}, 30_000);
@@ -1114,7 +1157,7 @@ function waitForNativeMacCaptureStop(proc: ChildProcessWithoutNullStreams) {
 		const inspect = (event: Record<string, unknown>) => {
 			if (event.event === "recording-stopped") {
 				cleanup();
-				resolve(String(event.screenPath ?? nativeMacCaptureTargetPath ?? ""));
+				resolve(String(event.screenPath ?? session.targetPath ?? ""));
 				return;
 			}
 			if (event.event === "error") {
@@ -1125,16 +1168,15 @@ function waitForNativeMacCaptureStop(proc: ChildProcessWithoutNullStreams) {
 
 		const onOutput = (event: Record<string, unknown>) => inspect(event);
 		const onClose = (code: number | null) => {
-			if (code === 0 && nativeMacCaptureTargetPath) {
+			if (code === 0 && session.targetPath) {
 				cleanup();
-				resolve(nativeMacCaptureTargetPath);
+				resolve(session.targetPath);
 				return;
 			}
 			cleanup();
 			reject(
 				new Error(
-					nativeMacCaptureOutput.trim() ||
-						`Native macOS capture exited with code=${code ?? "unknown"}`,
+					session.output.trim() || `Native macOS capture exited with code=${code ?? "unknown"}`,
 				),
 			);
 		};
@@ -1152,7 +1194,7 @@ function waitForNativeMacCaptureStop(proc: ChildProcessWithoutNullStreams) {
 		nativeMacCaptureEvents.on("helper-event", onOutput);
 		proc.once("close", onClose);
 		proc.once("error", onError);
-		inspectNativeMacCaptureOutput();
+		inspectNativeMacCaptureOutput(session);
 	});
 }
 
@@ -1484,6 +1526,7 @@ export function registerIpcHandlers(
 	ipcMain.handle(
 		"start-native-windows-recording",
 		async (_, request: NativeWindowsRecordingRequest) => {
+			let createdSessionId: number | null = null;
 			try {
 				if (!isWindowsGraphicsCaptureOsSupported()) {
 					return {
@@ -1491,7 +1534,10 @@ export function registerIpcHandlers(
 						error: "Windows Graphics Capture requires Windows 10 build 19041 or newer.",
 					};
 				}
-				if (nativeWindowsCaptureProcess) {
+				if (nativeWindowsCaptures.size > 0) {
+					// Phase 1: single-session API. Phase 2 will let the caller opt
+					// into multiple parallel sessions by passing an explicit
+					// recordingId per source.
 					return { success: false, error: "Native Windows capture is already running." };
 				}
 
@@ -1593,20 +1639,9 @@ export function registerIpcHandlers(
 				});
 
 				await fs.mkdir(RECORDINGS_DIR, { recursive: true });
-				nativeWindowsCaptureOutput = "";
-				nativeWindowsCaptureTargetPath = outputPath;
-				nativeWindowsCaptureWebcamTargetPath = request.webcam.enabled ? webcamOutputPath : null;
-				nativeWindowsCaptureRecordingId = recordingId;
-				nativeWindowsCursorOffsetMs = 0;
-				nativeWindowsCursorCaptureMode = cursorCaptureMode;
-				nativeWindowsCursorRecordingStartMs = 0;
-				nativeWindowsPauseStartedAtMs = null;
-				nativeWindowsPauseRanges = [];
-				nativeWindowsIsPaused = false;
 
 				const cursorStartTimeMs = Date.now();
 				if (cursorCaptureMode === "editable-overlay") {
-					nativeWindowsCursorRecordingStartMs = cursorStartTimeMs;
 					await startCursorRecording(cursorStartTimeMs);
 					console.info("[native-wgc] cursor sampler ready", {
 						cursorStartTimeMs,
@@ -1621,18 +1656,33 @@ export function registerIpcHandlers(
 					stdio: ["pipe", "pipe", "pipe"],
 					windowsHide: true,
 				});
-				nativeWindowsCaptureProcess = proc;
 
-				await waitForNativeWindowsCaptureStart(proc);
+				const session: NativeWindowsCaptureSession = {
+					recordingId,
+					process: proc,
+					output: "",
+					targetPath: outputPath,
+					webcamTargetPath: request.webcam.enabled ? webcamOutputPath : null,
+					cursorOffsetMs: 0,
+					cursorCaptureMode,
+					cursorRecordingStartMs: cursorCaptureMode === "editable-overlay" ? cursorStartTimeMs : 0,
+					pauseStartedAtMs: null,
+					pauseRanges: [],
+					isPaused: false,
+				};
+				nativeWindowsCaptures.set(recordingId, session);
+				createdSessionId = recordingId;
+
+				await waitForNativeWindowsCaptureStart(session);
 				const captureStartedAtMs = Date.now();
-				nativeWindowsCursorOffsetMs =
+				session.cursorOffsetMs =
 					cursorCaptureMode === "editable-overlay"
 						? Math.max(0, captureStartedAtMs - cursorStartTimeMs)
 						: 0;
-				const webcamFormat = readNativeWindowsWebcamFormat(nativeWindowsCaptureOutput);
+				const webcamFormat = readNativeWindowsWebcamFormat(session.output);
 				console.info("[native-wgc] capture started", {
 					captureStartedAtMs,
-					cursorOffsetMs: nativeWindowsCursorOffsetMs,
+					cursorOffsetMs: session.cursorOffsetMs,
 					webcamFormat,
 				});
 
@@ -1649,17 +1699,11 @@ export function registerIpcHandlers(
 				};
 			} catch (error) {
 				console.error("Failed to start native Windows recording:", error);
-				nativeWindowsCaptureProcess?.kill();
-				nativeWindowsCaptureProcess = null;
-				nativeWindowsCaptureTargetPath = null;
-				nativeWindowsCaptureWebcamTargetPath = null;
-				nativeWindowsCaptureRecordingId = null;
-				nativeWindowsCursorOffsetMs = 0;
-				nativeWindowsCursorCaptureMode = "editable-overlay";
-				nativeWindowsCursorRecordingStartMs = 0;
-				nativeWindowsPauseStartedAtMs = null;
-				nativeWindowsPauseRanges = [];
-				nativeWindowsIsPaused = false;
+				if (createdSessionId !== null) {
+					const session = nativeWindowsCaptures.get(createdSessionId);
+					session?.process.kill();
+					nativeWindowsCaptures.delete(createdSessionId);
+				}
 				await stopCursorRecording();
 				return { success: false, error: String(error) };
 			}
@@ -1667,11 +1711,13 @@ export function registerIpcHandlers(
 	);
 
 	ipcMain.handle("start-native-mac-recording", async (_, request: NativeMacRecordingRequest) => {
+		let createdSessionId: number | null = null;
 		try {
 			if (process.platform !== "darwin") {
 				return { success: false, error: "Native macOS capture requires macOS." };
 			}
-			if (nativeMacCaptureProcess) {
+			if (nativeMacCaptures.size > 0) {
+				// Phase 1: single-session API. Phase 2 will allow multi-session.
 				return { success: false, error: "Native macOS capture is already running." };
 			}
 
@@ -1749,19 +1795,9 @@ export function registerIpcHandlers(
 			});
 
 			await fs.mkdir(RECORDINGS_DIR, { recursive: true });
-			nativeMacCaptureOutput = "";
-			nativeMacCaptureTargetPath = outputPath;
-			nativeMacCaptureRecordingId = recordingId;
-			nativeMacCursorOffsetMs = 0;
-			nativeMacCursorCaptureMode = cursorCaptureMode;
-			nativeMacCursorRecordingStartMs = 0;
-			nativeMacPauseStartedAtMs = null;
-			nativeMacPauseRanges = [];
-			nativeMacIsPaused = false;
 
 			const cursorStartTimeMs = Date.now();
 			if (cursorCaptureMode === "editable-overlay") {
-				nativeMacCursorRecordingStartMs = cursorStartTimeMs;
 				await startCursorRecording(cursorStartTimeMs);
 			} else {
 				pendingCursorRecordingData = null;
@@ -1771,12 +1807,26 @@ export function registerIpcHandlers(
 				cwd: RECORDINGS_DIR,
 				stdio: ["pipe", "pipe", "pipe"],
 			});
-			nativeMacCaptureProcess = proc;
-			attachNativeMacCaptureOutputDrain(proc);
 
-			await waitForNativeMacCaptureStart(proc);
+			const session: NativeMacCaptureSession = {
+				recordingId,
+				process: proc,
+				output: "",
+				targetPath: outputPath,
+				cursorOffsetMs: 0,
+				cursorCaptureMode,
+				cursorRecordingStartMs: cursorCaptureMode === "editable-overlay" ? cursorStartTimeMs : 0,
+				pauseStartedAtMs: null,
+				pauseRanges: [],
+				isPaused: false,
+			};
+			nativeMacCaptures.set(recordingId, session);
+			createdSessionId = recordingId;
+			attachNativeMacCaptureOutputDrain(session);
+
+			await waitForNativeMacCaptureStart(session);
 			const captureStartedAtMs = Date.now();
-			nativeMacCursorOffsetMs =
+			session.cursorOffsetMs =
 				cursorCaptureMode === "editable-overlay"
 					? Math.max(0, captureStartedAtMs - cursorStartTimeMs)
 					: 0;
@@ -1794,16 +1844,11 @@ export function registerIpcHandlers(
 			};
 		} catch (error) {
 			console.error("Failed to start native macOS recording:", error);
-			nativeMacCaptureProcess?.kill();
-			nativeMacCaptureProcess = null;
-			nativeMacCaptureTargetPath = null;
-			nativeMacCaptureRecordingId = null;
-			nativeMacCursorOffsetMs = 0;
-			nativeMacCursorCaptureMode = "editable-overlay";
-			nativeMacCursorRecordingStartMs = 0;
-			nativeMacPauseStartedAtMs = null;
-			nativeMacPauseRanges = [];
-			nativeMacIsPaused = false;
+			if (createdSessionId !== null) {
+				const session = nativeMacCaptures.get(createdSessionId);
+				session?.process.kill();
+				nativeMacCaptures.delete(createdSessionId);
+			}
 			await stopCursorRecording();
 			return { success: false, error: error instanceof Error ? error.message : String(error) };
 		}
@@ -1814,21 +1859,22 @@ export function registerIpcHandlers(
 			return { success: false, error: "Native macOS capture requires macOS." };
 		}
 
-		const proc = nativeMacCaptureProcess;
-		if (!proc) {
+		const session = getOnlyActiveMacCapture();
+		if (!session) {
 			return { success: false, error: "Native macOS capture is not running." };
 		}
-		if (nativeMacIsPaused) {
+		if (session.isPaused) {
 			return { success: true };
 		}
+		const proc = session.process;
 		if (!proc.stdin.writable) {
 			return { success: false, error: "Native macOS capture command channel is closed." };
 		}
 
 		try {
 			proc.stdin.write("pause\n");
-			nativeMacIsPaused = true;
-			nativeMacPauseStartedAtMs = Date.now();
+			session.isPaused = true;
+			session.pauseStartedAtMs = Date.now();
 			return { success: true };
 		} catch (error) {
 			return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -1840,21 +1886,22 @@ export function registerIpcHandlers(
 			return { success: false, error: "Native macOS capture requires macOS." };
 		}
 
-		const proc = nativeMacCaptureProcess;
-		if (!proc) {
+		const session = getOnlyActiveMacCapture();
+		if (!session) {
 			return { success: false, error: "Native macOS capture is not running." };
 		}
-		if (!nativeMacIsPaused) {
+		if (!session.isPaused) {
 			return { success: true };
 		}
+		const proc = session.process;
 		if (!proc.stdin.writable) {
 			return { success: false, error: "Native macOS capture command channel is closed." };
 		}
 
 		try {
 			proc.stdin.write("resume\n");
-			completeNativeMacCursorPauseRange();
-			nativeMacIsPaused = false;
+			completeNativeMacCursorPauseRange(session);
+			session.isPaused = false;
 			return { success: true };
 		} catch (error) {
 			return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -1862,21 +1909,22 @@ export function registerIpcHandlers(
 	});
 
 	ipcMain.handle("pause-native-windows-recording", async () => {
-		const proc = nativeWindowsCaptureProcess;
-		if (!proc) {
+		const session = getOnlyActiveWindowsCapture();
+		if (!session) {
 			return { success: false, error: "Native Windows capture is not running." };
 		}
-		if (nativeWindowsIsPaused) {
+		if (session.isPaused) {
 			return { success: true };
 		}
+		const proc = session.process;
 		if (!proc.stdin.writable) {
 			return { success: false, error: "Native Windows capture command channel is closed." };
 		}
 
 		try {
 			proc.stdin.write("pause\n");
-			nativeWindowsIsPaused = true;
-			nativeWindowsPauseStartedAtMs = Date.now();
+			session.isPaused = true;
+			session.pauseStartedAtMs = Date.now();
 			return { success: true };
 		} catch (error) {
 			return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -1884,21 +1932,22 @@ export function registerIpcHandlers(
 	});
 
 	ipcMain.handle("resume-native-windows-recording", async () => {
-		const proc = nativeWindowsCaptureProcess;
-		if (!proc) {
+		const session = getOnlyActiveWindowsCapture();
+		if (!session) {
 			return { success: false, error: "Native Windows capture is not running." };
 		}
-		if (!nativeWindowsIsPaused) {
+		if (!session.isPaused) {
 			return { success: true };
 		}
+		const proc = session.process;
 		if (!proc.stdin.writable) {
 			return { success: false, error: "Native Windows capture command channel is closed." };
 		}
 
 		try {
 			proc.stdin.write("resume\n");
-			completeNativeWindowsCursorPauseRange();
-			nativeWindowsIsPaused = false;
+			completeNativeWindowsCursorPauseRange(session);
+			session.isPaused = false;
 			return { success: true };
 		} catch (error) {
 			return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -1906,19 +1955,19 @@ export function registerIpcHandlers(
 	});
 
 	ipcMain.handle("stop-native-windows-recording", async (_, discard?: boolean) => {
-		const proc = nativeWindowsCaptureProcess;
-		const preferredPath = nativeWindowsCaptureTargetPath;
-		const preferredWebcamPath = nativeWindowsCaptureWebcamTargetPath;
-		const recordingId = nativeWindowsCaptureRecordingId ?? Date.now();
-		const cursorCaptureMode = nativeWindowsCursorCaptureMode;
-
-		if (!proc) {
+		const session = getOnlyActiveWindowsCapture();
+		if (!session) {
 			return { success: false, error: "Native Windows capture is not running." };
 		}
+		const proc = session.process;
+		const preferredPath = session.targetPath;
+		const preferredWebcamPath = session.webcamTargetPath;
+		const recordingId = session.recordingId;
+		const cursorCaptureMode = session.cursorCaptureMode;
 
 		try {
-			completeNativeWindowsCursorPauseRange();
-			const stoppedPathPromise = waitForNativeWindowsCaptureStop(proc);
+			completeNativeWindowsCursorPauseRange(session);
+			const stoppedPathPromise = waitForNativeWindowsCaptureStop(session);
 			proc.stdin.write("stop\n");
 			const stoppedPath = await stoppedPathPromise;
 			const screenVideoPath = stoppedPath || preferredPath;
@@ -1942,8 +1991,8 @@ export function registerIpcHandlers(
 			}
 
 			if (cursorCaptureMode === "editable-overlay") {
-				compactPendingCursorTelemetryPauseRanges(nativeWindowsPauseRanges);
-				shiftPendingCursorTelemetry(nativeWindowsCursorOffsetMs);
+				compactPendingCursorTelemetryPauseRanges(session.pauseRanges);
+				shiftPendingCursorTelemetry(session.cursorOffsetMs);
 				await writePendingCursorTelemetry(screenVideoPath);
 			}
 			let webcamVideoPath: string | undefined;
@@ -1955,22 +2004,22 @@ export function registerIpcHandlers(
 					webcamVideoPath = undefined;
 				}
 			}
-			const session: RecordingSession = webcamVideoPath
+			const recordingSession: RecordingSession = webcamVideoPath
 				? { screenVideoPath, webcamVideoPath, createdAt: recordingId, cursorCaptureMode }
 				: { screenVideoPath, createdAt: recordingId, cursorCaptureMode };
-			setCurrentRecordingSessionState(session);
+			setCurrentRecordingSessionState(recordingSession);
 			currentProjectPath = null;
 
 			const sessionManifestPath = path.join(
 				RECORDINGS_DIR,
 				`${path.parse(screenVideoPath).name}${RECORDING_SESSION_SUFFIX}`,
 			);
-			await fs.writeFile(sessionManifestPath, JSON.stringify(session, null, 2), "utf-8");
+			await fs.writeFile(sessionManifestPath, JSON.stringify(recordingSession, null, 2), "utf-8");
 
 			return {
 				success: true,
 				path: screenVideoPath,
-				session,
+				session: recordingSession,
 				message: "Native Windows recording session stored successfully",
 			};
 		} catch (error) {
@@ -1978,19 +2027,10 @@ export function registerIpcHandlers(
 			await stopCursorRecording();
 			return { success: false, error: String(error) };
 		} finally {
-			nativeWindowsCaptureProcess = null;
-			nativeWindowsCaptureTargetPath = null;
-			nativeWindowsCaptureWebcamTargetPath = null;
-			nativeWindowsCaptureRecordingId = null;
-			nativeWindowsCursorOffsetMs = 0;
-			nativeWindowsCursorCaptureMode = "editable-overlay";
-			nativeWindowsCursorRecordingStartMs = 0;
-			nativeWindowsPauseStartedAtMs = null;
-			nativeWindowsPauseRanges = [];
-			nativeWindowsIsPaused = false;
-			const source = selectedSource || { name: "Screen" };
+			nativeWindowsCaptures.delete(recordingId);
+			const sourceName = selectedSource?.name ?? "Screen";
 			if (onRecordingStateChange) {
-				onRecordingStateChange(false, source.name);
+				onRecordingStateChange(false, sourceName);
 			}
 		}
 	});
@@ -2000,18 +2040,18 @@ export function registerIpcHandlers(
 			return { success: false, error: "Native macOS capture requires macOS." };
 		}
 
-		const proc = nativeMacCaptureProcess;
-		const preferredPath = nativeMacCaptureTargetPath;
-		const recordingId = nativeMacCaptureRecordingId ?? Date.now();
-		const cursorCaptureMode = nativeMacCursorCaptureMode;
-
-		if (!proc) {
+		const session = getOnlyActiveMacCapture();
+		if (!session) {
 			return { success: false, error: "Native macOS capture is not running." };
 		}
+		const proc = session.process;
+		const preferredPath = session.targetPath;
+		const recordingId = session.recordingId;
+		const cursorCaptureMode = session.cursorCaptureMode;
 
 		try {
-			completeNativeMacCursorPauseRange();
-			const stoppedPathPromise = waitForNativeMacCaptureStop(proc);
+			completeNativeMacCursorPauseRange(session);
+			const stoppedPathPromise = waitForNativeMacCaptureStop(session);
 			proc.stdin.write("stop\n");
 			const stoppedPath = await stoppedPathPromise;
 			const screenVideoPath = stoppedPath || preferredPath;
@@ -2034,29 +2074,29 @@ export function registerIpcHandlers(
 			}
 
 			if (cursorCaptureMode === "editable-overlay") {
-				compactPendingCursorTelemetryPauseRanges(nativeMacPauseRanges);
-				shiftPendingCursorTelemetry(nativeMacCursorOffsetMs);
+				compactPendingCursorTelemetryPauseRanges(session.pauseRanges);
+				shiftPendingCursorTelemetry(session.cursorOffsetMs);
 				await writePendingCursorTelemetry(screenVideoPath);
 			}
 
-			const session: RecordingSession = {
+			const recordingSession: RecordingSession = {
 				screenVideoPath,
 				createdAt: recordingId,
 				cursorCaptureMode,
 			};
-			setCurrentRecordingSessionState(session);
+			setCurrentRecordingSessionState(recordingSession);
 			currentProjectPath = null;
 
 			const sessionManifestPath = path.join(
 				RECORDINGS_DIR,
 				`${path.parse(screenVideoPath).name}${RECORDING_SESSION_SUFFIX}`,
 			);
-			await fs.writeFile(sessionManifestPath, JSON.stringify(session, null, 2), "utf-8");
+			await fs.writeFile(sessionManifestPath, JSON.stringify(recordingSession, null, 2), "utf-8");
 
 			return {
 				success: true,
 				path: screenVideoPath,
-				session,
+				session: recordingSession,
 				message: "Native macOS recording session stored successfully",
 			};
 		} catch (error) {
@@ -2064,18 +2104,10 @@ export function registerIpcHandlers(
 			await stopCursorRecording();
 			return { success: false, error: error instanceof Error ? error.message : String(error) };
 		} finally {
-			nativeMacCaptureProcess = null;
-			nativeMacCaptureTargetPath = null;
-			nativeMacCaptureRecordingId = null;
-			nativeMacCursorOffsetMs = 0;
-			nativeMacCursorCaptureMode = "editable-overlay";
-			nativeMacCursorRecordingStartMs = 0;
-			nativeMacPauseStartedAtMs = null;
-			nativeMacPauseRanges = [];
-			nativeMacIsPaused = false;
-			const source = selectedSource || { name: "Screen" };
+			nativeMacCaptures.delete(recordingId);
+			const sourceName = selectedSource?.name ?? "Screen";
 			if (onRecordingStateChange) {
-				onRecordingStateChange(false, source.name);
+				onRecordingStateChange(false, sourceName);
 			}
 		}
 	});
