@@ -212,6 +212,7 @@ bool WgcSession::initialize(HMONITOR monitor, int fps, bool captureCursor) {
 
 bool WgcSession::initialize(HWND window, int fps, bool captureCursor) {
     fps_ = fps > 0 ? fps : 60;
+    windowHandle_ = window;
     if (!createD3DDevice()) {
         return false;
     }
@@ -296,6 +297,12 @@ void WgcSession::onFrameArrived(
         callback(texture.Get(), timeSpanToHns(frame.SystemRelativeTime()));
     }
     frame.Close();
+
+    // Phase 6: record arrival time so the encoder loop can decide when the
+    // WGC stream has gone quiet and the PrintWindow fallback should kick in.
+    lastFrameArrivedSteadyNs_.store(
+        std::chrono::steady_clock::now().time_since_epoch().count(),
+        std::memory_order_relaxed);
 }
 
 int WgcSession::captureWidth() const {

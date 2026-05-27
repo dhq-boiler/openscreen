@@ -1,10 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 
 # The local Windows SDK image used by some contributors can miss gdi32.lib,
-# while CMake's default MSVC console template links it unconditionally. This
-# helper does not use GDI, so keep the standard library set minimal and explicit.
+# while CMake's default MSVC console template links it unconditionally. Keep
+# the standard library set minimal and explicit so missing-SDK warnings are
+# loud. Phase 6 introduces a PrintWindow / CreateDIBSection fallback for
+# static windows, which needs gdi32.lib.
 set(CMAKE_CXX_STANDARD_LIBRARIES
-  "kernel32.lib user32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib"
+  "kernel32.lib user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib"
   CACHE STRING "" FORCE)
 
 project(openscreen-wgc-capture LANGUAGES CXX)

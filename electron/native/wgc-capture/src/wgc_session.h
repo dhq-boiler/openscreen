@@ -9,6 +9,8 @@
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 #include <wrl/client.h>
 
+#include <atomic>
+#include <chrono>
 #include <functional>
 #include <mutex>
 
@@ -33,6 +35,17 @@ public:
     ID3D11Device* device() const;
     ID3D11DeviceContext* context() const;
 
+    // Phase 6: PrintWindow fallback support. windowHandle() is INVALID_HANDLE
+    // when the session was created for a monitor (display capture); the
+    // fallback should be skipped in that case. lastFrameArrivedSteady()
+    // returns the steady_clock time at which the most recent WGC frame
+    // landed in onFrameArrived; the value is 0 until the first frame.
+    HWND windowHandle() const { return windowHandle_; }
+    std::chrono::steady_clock::time_point lastFrameArrivedSteady() const {
+        return std::chrono::steady_clock::time_point(
+            std::chrono::steady_clock::duration(lastFrameArrivedSteadyNs_.load()));
+    }
+
 private:
     bool createD3DDevice();
     bool createCaptureItem(HMONITOR monitor);
@@ -56,4 +69,8 @@ private:
     int fps_ = 60;
     bool captureCursor_ = false;
     bool started_ = false;
+    HWND windowHandle_ = nullptr;
+    // Stored as nanoseconds-since-steady-clock-epoch so it fits in an atomic
+    // without a dedicated mutex. 0 means "no frame yet".
+    std::atomic<int64_t> lastFrameArrivedSteadyNs_{0};
 };

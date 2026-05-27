@@ -547,6 +547,69 @@ int main(int argc, char* argv[]) {
     uint64_t latestWebcamSequence = 0;
     bool hasVisibleWebcamFrame = false;
 
+    // Phase 6: PrintWindow fallback so static windows (no repaint events) still
+    // get encoded frames instead of a single black frame stretched across the
+    // whole recording. WGC silently stops delivering frames when the source
+    // window does not invalidate itself; PrintWindow forces the window to
+    // render into our DC even when nothing on screen has changed.
+    //
+    // We only enable this for HWND sources (display capture has no HWND to
+    // print). The PrintWindow buffer is allocated lazily on first use.
+    std::vector<BYTE> printWindowBuffer;
+    auto captureViaPrintWindow = [&](HWND hwnd, int width, int height) -> bool {
+        if (!hwnd || width <= 0 || height <= 0) {
+            return false;
+        }
+        HDC screenDC = GetDC(nullptr);
+        if (!screenDC) {
+            return false;
+        }
+        HDC memDC = CreateCompatibleDC(screenDC);
+        if (!memDC) {
+            ReleaseDC(nullptr, screenDC);
+            return false;
+        }
+        BITMAPINFO bmi{};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = width;
+        // Negative height => top-down DIB so the rows match D3D11 / WGC layout.
+        bmi.bmiHeader.biHeight = -height;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HBITMAP bmp = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (!bmp || !bits) {
+            if (bmp) {
+                DeleteObject(bmp);
+            }
+            DeleteDC(memDC);
+            ReleaseDC(nullptr, screenDC);
+            return false;
+        }
+        HGDIOBJ oldObj = SelectObject(memDC, bmp);
+        // PW_RENDERFULLCONTENT (0x00000002) is required for Chromium / DWM
+        // composited windows; without it those targets often print as blank.
+        // The macro ships in modern Windows SDKs but guard for older builds.
+#ifndef PW_RENDERFULLCONTENT
+#define PW_RENDERFULLCONTENT 0x00000002
+#endif
+        BOOL printed = PrintWindow(hwnd, memDC, PW_RENDERFULLCONTENT);
+        bool ok = false;
+        if (printed) {
+            const size_t byteCount = static_cast<size_t>(width) * height * 4;
+            printWindowBuffer.assign(static_cast<BYTE*>(bits),
+                                     static_cast<BYTE*>(bits) + byteCount);
+            ok = true;
+        }
+        SelectObject(memDC, oldObj);
+        DeleteObject(bmp);
+        DeleteDC(memDC);
+        ReleaseDC(nullptr, screenDC);
+        return ok;
+    };
+    bool loggedPrintWindowFallback = false;
+
     session.setFrameCallback([&](ID3D11Texture2D* texture, int64_t timestampHns) {
         if (control.stopRequested || control.paused) {
             return;
@@ -668,6 +731,86 @@ int main(int argc, char* argv[]) {
 
     auto startVideoWriter = [&]() {
         videoWriterThread = std::thread(writeVideoFrames);
+    };
+
+    // Phase 6: periodic PrintWindow watchdog. When the WGC source is a window
+    // that doesn't repaint itself (idle terminal, paused video, etc.), WGC
+    // simply stops delivering frames. This thread checks how long it's been
+    // since onFrameArrived last fired and, if the gap exceeds the polling
+    // interval, uses PrintWindow to fabricate a fresh frame from the current
+    // window pixels. The fresh frame goes into latestFrameTexture exactly
+    // like a real WGC frame, so writeVideoFrames keeps emitting at the target
+    // fps without any code path changes downstream.
+    std::thread printWindowWatchdogThread;
+    auto stopPrintWindowWatchdog = [&]() {
+        if (printWindowWatchdogThread.joinable()) {
+            printWindowWatchdogThread.join();
+        }
+    };
+    auto startPrintWindowWatchdog = [&]() {
+        HWND hwnd = session.windowHandle();
+        if (!hwnd) {
+            return; // Display (HMONITOR) capture: no window to print.
+        }
+        printWindowWatchdogThread = std::thread([&, hwnd]() {
+            using clock = std::chrono::steady_clock;
+            const auto pollInterval = std::chrono::milliseconds(500);
+            const int width = session.captureWidth();
+            const int height = session.captureHeight();
+            while (!control.stopRequested && !encodeFailed) {
+                std::this_thread::sleep_for(pollInterval);
+                if (control.stopRequested || encodeFailed || control.paused) {
+                    continue;
+                }
+                const auto lastArrived = session.lastFrameArrivedSteady();
+                const auto now = clock::now();
+                // Only step in once WGC has gone quiet for longer than the
+                // poll interval. lastArrived defaults to clock epoch (0) so
+                // the first PrintWindow fires shortly after capture start
+                // even when WGC never emits a single frame.
+                if (lastArrived != clock::time_point() &&
+                    now - lastArrived < pollInterval) {
+                    continue;
+                }
+                if (!captureViaPrintWindow(hwnd, width, height)) {
+                    continue;
+                }
+                std::scoped_lock lock(mutex);
+                if (!latestFrameTexture) {
+                    D3D11_TEXTURE2D_DESC desc{};
+                    desc.Width = static_cast<UINT>(width);
+                    desc.Height = static_cast<UINT>(height);
+                    desc.MipLevels = 1;
+                    desc.ArraySize = 1;
+                    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                    desc.SampleDesc.Count = 1;
+                    desc.Usage = D3D11_USAGE_DEFAULT;
+                    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                    if (FAILED(session.device()->CreateTexture2D(
+                            &desc, nullptr, &latestFrameTexture))) {
+                        continue;
+                    }
+                }
+                session.context()->UpdateSubresource(
+                    latestFrameTexture.Get(),
+                    0,
+                    nullptr,
+                    printWindowBuffer.data(),
+                    static_cast<UINT>(width) * 4,
+                    0);
+                // Advance the synthetic timestamp by one source tick so the
+                // encoder loop never sees the timestamp go backwards.
+                latestFrameTimestampHns += static_cast<int64_t>(10'000'000ULL / config.fps);
+                if (!loggedPrintWindowFallback) {
+                    loggedPrintWindowFallback = true;
+                    std::cout << "{\"event\":\"printwindow-fallback-active\","
+                              << "\"reason\":\"wgc-frames-stalled\"}" << std::endl;
+                }
+                if (!firstFrameWritten.exchange(true)) {
+                    control.cv.notify_all();
+                }
+            }
+        });
     };
 
     std::unique_ptr<AudioMixer> audioMixer;
@@ -812,6 +955,7 @@ int main(int argc, char* argv[]) {
         audioMixer->beginTimeline();
     }
     startVideoWriter();
+    startPrintWindowWatchdog();
 
     std::cout << "{\"event\":\"recording-started\",\"schemaVersion\":2}" << std::endl;
     std::cout << "Recording started" << std::endl;
@@ -830,6 +974,7 @@ int main(int argc, char* argv[]) {
         audioMixer->stop();
     }
     stopVideoWriter();
+    stopPrintWindowWatchdog();
     session.stop();
     {
         std::scoped_lock lock(mutex);
