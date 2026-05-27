@@ -165,6 +165,23 @@ export function computeZoomTransform({
 	};
 }
 
+/**
+ * Apply a computed zoom transform to a DOM element via CSS `transform`.
+ *
+ * Mirrors PixiJS Container.position + scale semantics: translates first by
+ * `transform.x` / `transform.y` in element-pixel units, then scales from
+ * the top-left corner. `transform-origin: 0 0` keeps the math consistent
+ * with computeZoomTransform's output (which assumes a top-left anchor).
+ *
+ * Used by the editor for stage-wide zoom (background + every layer share
+ * one CSS-transformed wrapper). The PixiJS path (applyZoomTransform) is
+ * still used by the export pipeline.
+ */
+export function applyDomZoomTransform(element: HTMLElement, transform: AppliedTransform): void {
+	element.style.transformOrigin = "0 0";
+	element.style.transform = `translate3d(${transform.x}px, ${transform.y}px, 0) scale(${transform.scale})`;
+}
+
 export function computeFocusFromTransform({
 	stageSize,
 	baseMask,
