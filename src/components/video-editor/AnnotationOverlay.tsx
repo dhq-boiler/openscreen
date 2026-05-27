@@ -1,4 +1,10 @@
-import { type CSSProperties, type PointerEvent, useEffect, useRef, useState } from "react";
+import {
+	type CSSProperties,
+	type PointerEvent as ReactPointerEvent,
+	useEffect,
+	useRef,
+	useState,
+} from "react";
 import { Rnd } from "react-rnd";
 import {
 	getBlurOverlayColor,
@@ -192,7 +198,7 @@ export function AnnotationOverlay({
 		return <ArrowComponent color={color} strokeWidth={strokeWidth} />;
 	};
 
-	const normalizePoint = (event: PointerEvent<HTMLDivElement>) => {
+	const normalizePoint = (event: ReactPointerEvent<HTMLDivElement>) => {
 		const rect = event.currentTarget.getBoundingClientRect();
 		const x = ((event.clientX - rect.left) / rect.width) * 100;
 		const y = ((event.clientY - rect.top) / rect.height) * 100;
@@ -217,7 +223,7 @@ export function AnnotationOverlay({
 		}
 	};
 
-	const handleFreehandPointerDown = (event: PointerEvent<HTMLDivElement>) => {
+	const handleFreehandPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
 		if (
 			!isSelected ||
 			annotation.type !== "blur" ||
@@ -237,7 +243,7 @@ export function AnnotationOverlay({
 		setLivePointerPoint(point);
 	};
 
-	const handleFreehandPointerMove = (event: PointerEvent<HTMLDivElement>) => {
+	const handleFreehandPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
 		if (!isDrawingFreehandRef.current) return;
 		event.preventDefault();
 		event.stopPropagation();
@@ -247,7 +253,7 @@ export function AnnotationOverlay({
 		setDraftFreehandPoints([...freehandPointsRef.current]);
 	};
 
-	const finishFreehandPointer = (event: PointerEvent<HTMLDivElement>) => {
+	const finishFreehandPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
 		if (!isDrawingFreehandRef.current || !onBlurDataChange) return;
 		isDrawingFreehandRef.current = false;
 		setIsFreehandDrawing(false);
@@ -499,6 +505,214 @@ export function AnnotationOverlay({
 		}
 	};
 
+	// Phase 11: blur is rendered as a plain absolutely-positioned div instead
+	// of an Rnd. react-rnd / react-draggable apply an internal position
+	// correction when the wrapping element carries a CSS transform (Phase 10's
+	// zoom transform on stageContentRef), which detaches the blur from the
+	// content it was placed over. A bare div inherits the parent transform
+	// cleanly, so the blur stays glued to the underlying pixels through zoom.
+	// Drag and resize are reimplemented here against pointer events so the
+	// blur still follows the cursor, with mouse deltas divided by the parent's
+	// CSS scale to keep the gesture proportional to what the user sees.
+	// Cast to string to keep the Rnd branch below (text / image / figure)
+	// from being type-narrowed away.
+	if ((annotation.type as string) === "blur") {
+		const isResizableNow = isSelected && !isSelectedFreehandBlur;
+
+		const getParentScale = (rect: DOMRect): number => {
+			if (rect.width <= 0 || containerWidth <= 0) return 1;
+			return rect.width / containerWidth;
+		};
+
+		const startBodyDrag = (e: ReactPointerEvent<HTMLDivElement>) => {
+			if (!isResizableNow) return;
+			const target = e.currentTarget;
+			const parentEl = target.parentElement;
+			if (!parentEl) return;
+			e.preventDefault();
+			e.stopPropagation();
+			try {
+				target.setPointerCapture(e.pointerId);
+			} catch {
+				// Capture is best-effort; some pointer types reject it.
+			}
+			isDraggingRef.current = true;
+			const parentScale = getParentScale(parentEl.getBoundingClientRect());
+			const startMouseX = e.clientX;
+			const startMouseY = e.clientY;
+			const startX = liveRect.x;
+			const startY = liveRect.y;
+
+			const handleMove = (mv: PointerEvent) => {
+				const dx = (mv.clientX - startMouseX) / parentScale;
+				const dy = (mv.clientY - startMouseY) / parentScale;
+				setLiveRect((prev) => ({ ...prev, x: startX + dx, y: startY + dy }));
+			};
+			const handleEnd = (uv: PointerEvent) => {
+				target.removeEventListener("pointermove", handleMove);
+				target.removeEventListener("pointerup", handleEnd);
+				target.removeEventListener("pointercancel", handleEnd);
+				try {
+					target.releasePointerCapture(uv.pointerId);
+				} catch {
+					// Capture release can fail if it was never granted.
+				}
+				const dx = (uv.clientX - startMouseX) / parentScale;
+				const dy = (uv.clientY - startMouseY) / parentScale;
+				const finalX = startX + dx;
+				const finalY = startY + dy;
+				setLiveRect((prev) => ({ ...prev, x: finalX, y: finalY }));
+				onPositionChange(annotation.id, {
+					x: (finalX / containerWidth) * 100,
+					y: (finalY / containerHeight) * 100,
+				});
+				setTimeout(() => {
+					isDraggingRef.current = false;
+				}, 100);
+			};
+			target.addEventListener("pointermove", handleMove);
+			target.addEventListener("pointerup", handleEnd);
+			target.addEventListener("pointercancel", handleEnd);
+		};
+
+		type Corner = "tl" | "tr" | "bl" | "br";
+		const MIN_SIZE = 20;
+		const startResize = (corner: Corner) => (e: ReactPointerEvent<HTMLDivElement>) => {
+			if (!isResizableNow) return;
+			const target = e.currentTarget;
+			const bodyEl = target.parentElement;
+			const parentEl = bodyEl?.parentElement;
+			if (!bodyEl || !parentEl) return;
+			e.preventDefault();
+			e.stopPropagation();
+			try {
+				target.setPointerCapture(e.pointerId);
+			} catch {
+				// Capture is best-effort; some pointer types reject it.
+			}
+			isDraggingRef.current = true;
+			const parentScale = getParentScale(parentEl.getBoundingClientRect());
+			const startMouseX = e.clientX;
+			const startMouseY = e.clientY;
+			const startX = liveRect.x;
+			const startY = liveRect.y;
+			const startW = liveRect.width;
+			const startH = liveRect.height;
+
+			const compute = (mvX: number, mvY: number) => {
+				const dx = (mvX - startMouseX) / parentScale;
+				const dy = (mvY - startMouseY) / parentScale;
+				let newX = startX;
+				let newY = startY;
+				let newW = startW;
+				let newH = startH;
+				if (corner === "tl") {
+					newX = startX + dx;
+					newY = startY + dy;
+					newW = startW - dx;
+					newH = startH - dy;
+				} else if (corner === "tr") {
+					newY = startY + dy;
+					newW = startW + dx;
+					newH = startH - dy;
+				} else if (corner === "bl") {
+					newX = startX + dx;
+					newW = startW - dx;
+					newH = startH + dy;
+				} else {
+					newW = startW + dx;
+					newH = startH + dy;
+				}
+				if (newW < MIN_SIZE) {
+					if (corner === "tl" || corner === "bl") {
+						newX = startX + startW - MIN_SIZE;
+					}
+					newW = MIN_SIZE;
+				}
+				if (newH < MIN_SIZE) {
+					if (corner === "tl" || corner === "tr") {
+						newY = startY + startH - MIN_SIZE;
+					}
+					newH = MIN_SIZE;
+				}
+				return { x: newX, y: newY, width: newW, height: newH };
+			};
+
+			const handleMove = (mv: PointerEvent) => {
+				setLiveRect(compute(mv.clientX, mv.clientY));
+			};
+			const handleEnd = (uv: PointerEvent) => {
+				target.removeEventListener("pointermove", handleMove);
+				target.removeEventListener("pointerup", handleEnd);
+				target.removeEventListener("pointercancel", handleEnd);
+				try {
+					target.releasePointerCapture(uv.pointerId);
+				} catch {
+					// Capture release can fail if it was never granted.
+				}
+				const final = compute(uv.clientX, uv.clientY);
+				setLiveRect(final);
+				onPositionChange(annotation.id, {
+					x: (final.x / containerWidth) * 100,
+					y: (final.y / containerHeight) * 100,
+				});
+				onSizeChange(annotation.id, {
+					width: (final.width / containerWidth) * 100,
+					height: (final.height / containerHeight) * 100,
+				});
+				setTimeout(() => {
+					isDraggingRef.current = false;
+				}, 100);
+			};
+			target.addEventListener("pointermove", handleMove);
+			target.addEventListener("pointerup", handleEnd);
+			target.addEventListener("pointercancel", handleEnd);
+		};
+
+		const handleStyle = (corner: Corner): CSSProperties => ({
+			position: "absolute",
+			width: 12,
+			height: 12,
+			backgroundColor: isSelected ? "white" : "transparent",
+			border: isSelected ? "2px solid #34B27B" : "none",
+			borderRadius: "50%",
+			...(corner === "tl" || corner === "bl" ? { left: -6 } : { right: -6 }),
+			...(corner === "tl" || corner === "tr" ? { top: -6 } : { bottom: -6 }),
+			cursor: corner === "tl" || corner === "br" ? "nwse-resize" : "nesw-resize",
+			zIndex: 2,
+		});
+
+		return (
+			<div
+				className={cn("annotation-overlay-tile", isResizableNow && "cursor-move")}
+				style={{
+					position: "absolute",
+					left: x,
+					top: y,
+					width: width,
+					height: height,
+					zIndex: isSelectedBoost ? zIndex + 1000 : zIndex,
+					pointerEvents: isSelected ? "auto" : "none",
+				}}
+				onPointerDown={startBodyDrag}
+				onClick={() => {
+					if (isDraggingRef.current) return;
+					onClick(annotation.id);
+				}}
+			>
+				<div className={cn("w-full h-full", "bg-transparent")}>{renderContent()}</div>
+				{isResizableNow && (
+					<>
+						<div onPointerDown={startResize("tl")} style={handleStyle("tl")} />
+						<div onPointerDown={startResize("tr")} style={handleStyle("tr")} />
+						<div onPointerDown={startResize("bl")} style={handleStyle("bl")} />
+						<div onPointerDown={startResize("br")} style={handleStyle("br")} />
+					</>
+				)}
+			</div>
+		);
+	}
+
 	return (
 		<Rnd
 			position={{ x, y }}
@@ -554,11 +768,16 @@ export function AnnotationOverlay({
 				if (isDraggingRef.current) return;
 				onClick(annotation.id);
 			}}
-			// Phase 6.5 fix: bounds="window" instead of "parent" so annotation
-			// tiles can be placed over Layer 2/3 (which live outside Layer 1's
-			// Rnd in multi-source projects). Single-source projects keep the
-			// same effective constraint since Layer 1 covers the stage anyway.
-			bounds="window"
+			// Phase 11 zoom-position fix: leave bounds unset. react-rnd's
+			// bounds enforcement re-runs getBoundingClientRect() on the
+			// reference element and clamps the Rnd's internal transform to
+			// keep it "inside" --- once the stage wrapper is CSS-scaled by
+			// Phase 10's zoom transform, that calculation pulls every blur
+			// back toward (0, 0) and detaches it from the content it was
+			// placed over. Skipping bounds restores prop-driven positioning,
+			// which now scales correctly with the parent transform. We still
+			// preserve the Phase 6.5 freedom (annotations can sit on Layer
+			// 2/3, not just inside the Layer 1 rect).
 			className={cn(
 				// Phase 6.5 fix: tagging the annotation Rnd so the primary
 				// layer's Rnd can exclude it from its own drag (cancel
