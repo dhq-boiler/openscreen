@@ -595,12 +595,50 @@ int main(int argc, char* argv[]) {
 #define PW_RENDERFULLCONTENT 0x00000002
 #endif
         BOOL printed = PrintWindow(hwnd, memDC, PW_RENDERFULLCONTENT);
-        bool ok = false;
-        if (printed) {
-            const size_t byteCount = static_cast<size_t>(width) * height * 4;
+
+        const size_t byteCount = static_cast<size_t>(width) * height * 4;
+        auto bufferLooksBlack = [&]() {
+            // Sample every 64th pixel — full-window scan on a 4K frame is
+            // 33M bytes and runs every 500ms otherwise. Empty PrintWindow
+            // outputs are uniformly 0 so sparse sampling is enough.
+            const BYTE* p = static_cast<const BYTE*>(bits);
+            const size_t stride = 64 * 4;
+            for (size_t i = 0; i < byteCount; i += stride) {
+                if (p[i] != 0 || p[i + 1] != 0 || p[i + 2] != 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        // Phase 6 fallback: PrintWindow returns an empty buffer for many
+        // GPU-rendered windows (WinUI 3 / Electron / DirectComposition).
+        // When that happens, fall back to BitBlt'ing from the screen DC at
+        // the window's on-screen rect. This only works if the window is
+        // actually visible on screen — if it's covered, the overlapping
+        // window's pixels will be picked up instead — but it lets static
+        // GPU windows be captured at all when no other path works.
+        bool ok = printed ? true : false;
+        if (printed && bufferLooksBlack()) {
+            RECT winRect{};
+            if (GetWindowRect(hwnd, &winRect)) {
+                const int winW = winRect.right - winRect.left;
+                const int winH = winRect.bottom - winRect.top;
+                if (winW > 0 && winH > 0) {
+                    // Stretch-blit from the on-screen rect into our buffer
+                    // so size mismatches between client area and capture
+                    // size don't matter.
+                    SetStretchBltMode(memDC, HALFTONE);
+                    StretchBlt(memDC, 0, 0, width, height,
+                               screenDC, winRect.left, winRect.top, winW, winH, SRCCOPY);
+                    ok = true;
+                }
+            }
+        }
+
+        if (ok) {
             printWindowBuffer.assign(static_cast<BYTE*>(bits),
                                      static_cast<BYTE*>(bits) + byteCount);
-            ok = true;
         }
         SelectObject(memDC, oldObj);
         DeleteObject(bmp);
@@ -755,8 +793,10 @@ int main(int argc, char* argv[]) {
         printWindowWatchdogThread = std::thread([&, hwnd]() {
             using clock = std::chrono::steady_clock;
             const auto pollInterval = std::chrono::milliseconds(500);
+            const auto recreateInterval = std::chrono::seconds(3);
             const int width = session.captureWidth();
             const int height = session.captureHeight();
+            clock::time_point lastRecreateAttempt{};
             while (!control.stopRequested && !encodeFailed) {
                 std::this_thread::sleep_for(pollInterval);
                 if (control.stopRequested || encodeFailed || control.paused) {
@@ -773,6 +813,16 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
                 if (!captureViaPrintWindow(hwnd, width, height)) {
+                    // Both PrintWindow and the BitBlt screen fallback came
+                    // back empty (typical for hidden / fully occluded
+                    // GPU-rendered windows). As a last-ditch attempt,
+                    // recreate the WGC frame pool every few seconds — that
+                    // sometimes elicits an initial frame from the new
+                    // capture session. Heavy, so rate-limited.
+                    if (now - lastRecreateAttempt > recreateInterval) {
+                        session.recreateFramePool();
+                        lastRecreateAttempt = now;
+                    }
                     continue;
                 }
                 std::scoped_lock lock(mutex);

@@ -46,6 +46,15 @@ public:
             std::chrono::steady_clock::duration(lastFrameArrivedSteadyNs_.load()));
     }
 
+    // Phase 6 (Recreate path): tear down the frame pool / session pair and
+    // build a fresh one against the same capture item. WGC sometimes emits
+    // a single initial frame on session start even when the source window
+    // hasn't repainted, so periodically recreating provides a frame for
+    // otherwise-quiet windows where PrintWindow + BitBlt both fail.
+    // Returns true when recreate succeeded; the FrameCallback set via
+    // setFrameCallback is preserved. Safe to call while running.
+    bool recreateFramePool();
+
 private:
     bool createD3DDevice();
     bool createCaptureItem(HMONITOR monitor);

@@ -252,6 +252,39 @@ bool WgcSession::start() {
     return true;
 }
 
+bool WgcSession::recreateFramePool() {
+    if (!item_ || !winrtDevice_) {
+        return false;
+    }
+    // Detach the old listener and close the old pool / session first so
+    // they're not contending with the new ones during the swap.
+    if (framePool_) {
+        framePool_.FrameArrived(frameArrivedToken_);
+        framePool_.Close();
+        framePool_ = nullptr;
+    }
+    if (session_) {
+        session_.Close();
+        session_ = nullptr;
+    }
+
+    framePool_ = wgcap::Direct3D11CaptureFramePool::CreateFreeThreaded(
+        winrtDevice_,
+        wgdx::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        2,
+        item_.Size());
+    session_ = framePool_.CreateCaptureSession(item_);
+
+    if (!applySessionOptions(captureCursor_)) {
+        return false;
+    }
+    frameArrivedToken_ = framePool_.FrameArrived({this, &WgcSession::onFrameArrived});
+    if (started_) {
+        session_.StartCapture();
+    }
+    return true;
+}
+
 void WgcSession::stop() {
     if (framePool_) {
         framePool_.FrameArrived(frameArrivedToken_);
