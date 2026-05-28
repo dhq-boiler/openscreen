@@ -22,7 +22,8 @@
 
 import {
 	type DisplayMediaWindowCaptureHandle,
-	startDisplayMediaWindowCapture,
+	type PreparedDisplayMediaWindowCapture,
+	prepareDisplayMediaWindowCapture,
 } from "./displayMediaWindowCapture";
 import type { NativeMacRecordingRequest } from "./nativeMacRecording";
 import type {
@@ -83,12 +84,40 @@ export interface MultiSourceRecordingHandle {
 	stopAll(options?: { discard?: boolean }): Promise<ProjectMediaV3>;
 }
 
+/**
+ * Returned by {@link prepareMultiSourceRecording}: every layer has done
+ * its heavy init (getUserMedia / WGC helper warmup) but capture has not
+ * begun. `commit()` flips all layers to recording (cheap), `discard()`
+ * tears the prepared resources down (used on countdown cancel).
+ */
+export interface PreparedMultiSourceRecording {
+	sessionId: string;
+	layerIds: string[];
+	commit(): Promise<MultiSourceRecordingHandle>;
+	discard(): Promise<void>;
+}
+
 interface ActiveLayerState {
 	target: MultiSourceTarget;
 	screenVideoPath: string;
 	webcamVideoPath?: string;
 	/** Phase 7: in-process handle for display-media targets (null for native). */
 	displayMediaHandle?: DisplayMediaWindowCaptureHandle;
+}
+
+/**
+ * Per-target prepared state. For display-media we already hold the
+ * getUserMedia stream + MediaRecorder; for win32 (Phase B) the native
+ * helper is spawned in armed mode and we cache its recordingId + output
+ * path so commit can address the same process. mac native prepare is
+ * still a no-op pending a future port of the armed-start protocol to
+ * the macOS helper.
+ */
+interface PreparedLayerState {
+	target: MultiSourceTarget;
+	displayMediaPrepared?: PreparedDisplayMediaWindowCapture;
+	nativeWindowsArmedRecordingId?: number;
+	nativeWindowsArmedPath?: string;
 }
 
 /**
@@ -124,24 +153,121 @@ function getElectronAPI() {
 	return window.electronAPI;
 }
 
-async function startOneTarget(
-	target: MultiSourceTarget,
-): Promise<{ screenVideoPath: string; displayMediaHandle?: DisplayMediaWindowCaptureHandle }> {
+/**
+ * First half of the two-stage start: do the heavy per-target init that
+ * can run concurrently with the record countdown. For display-media this
+ * is getUserMedia + MediaRecorder construction; for win32 it spawns the
+ * native helper in armed mode (WGC + Media Foundation init) and caches
+ * its recordingId for commit. mac native prepare is still a no-op until
+ * the macOS helper supports armed start — it falls back to a one-shot
+ * start at commit time.
+ */
+async function prepareOneTarget(target: MultiSourceTarget): Promise<PreparedLayerState> {
 	if (target.platform === "display-media") {
-		const handle = await startDisplayMediaWindowCapture({
+		const prepared = await prepareDisplayMediaWindowCapture({
 			sourceId: target.sourceId,
 			fileName: target.fileName,
 			fps: target.fps,
 			maxWidth: target.maxWidth,
 			maxHeight: target.maxHeight,
 		});
+		return { target, displayMediaPrepared: prepared };
+	}
+
+	if (target.platform === "win32") {
+		const api = getElectronAPI();
+		const request = {
+			...target.request,
+			recordingId: target.recordingId,
+		} as NativeWindowsRecordingRequest;
+		const result = await api.prepareNativeWindowsRecording(request);
+		if (!result.success) {
+			throw new Error(
+				result.error ?? `Failed to prepare win32 recording for layer ${target.layerId}.`,
+			);
+		}
+		const path = result.path;
+		if (!path) {
+			throw new Error(
+				`win32 recording for layer ${target.layerId} returned no output path during prepare.`,
+			);
+		}
+		return {
+			target,
+			nativeWindowsArmedRecordingId: target.recordingId,
+			nativeWindowsArmedPath: path,
+		};
+	}
+
+	// darwin: prepare is a no-op until the macOS helper learns armed mode.
+	return { target };
+}
+
+function discardOneTarget(prepared: PreparedLayerState): void {
+	prepared.displayMediaPrepared?.discard();
+	if (prepared.nativeWindowsArmedRecordingId !== undefined) {
+		// Send a stop with `discard: true` so the armed helper exits
+		// cleanly without producing an output file. We don't await so
+		// callers in `discard()` can stay synchronous; the helper exits
+		// in <100ms in practice.
+		try {
+			void getElectronAPI()
+				.stopNativeWindowsRecording({
+					recordingId: prepared.nativeWindowsArmedRecordingId,
+					discard: true,
+				})
+				.catch(() => {
+					// Best-effort cleanup. If the IPC fails the helper
+					// will still exit when its stdin closes.
+				});
+		} catch {
+			// getElectronAPI threw — nothing left to clean up.
+		}
+	}
+}
+
+/**
+ * Second half of the two-stage start: flip the prepared layer into a
+ * recording state. For display-media this is just `recorder.start()`;
+ * for an armed win32 helper it sends the stdin "start" command via the
+ * commit IPC; mac (or an unprepared win32) falls back to a one-shot
+ * start IPC.
+ */
+async function commitOneTarget(
+	prepared: PreparedLayerState,
+): Promise<{ screenVideoPath: string; displayMediaHandle?: DisplayMediaWindowCaptureHandle }> {
+	const target = prepared.target;
+	if (target.platform === "display-media") {
+		if (!prepared.displayMediaPrepared) {
+			throw new Error(`display-media layer ${target.layerId} was not prepared before commit.`);
+		}
+		const handle = prepared.displayMediaPrepared.commit();
 		// Provisional path: stopOneTarget will refresh this with the
 		// definitive on-disk path the main process resolved.
 		return { screenVideoPath: target.fileName, displayMediaHandle: handle };
 	}
 
 	const api = getElectronAPI();
-	// Force-override the request's recordingId so we own id allocation.
+
+	// Phase B fast path: the win32 helper was already armed during
+	// prepare; commit just flips it into the capture loop.
+	if (target.platform === "win32" && prepared.nativeWindowsArmedRecordingId !== undefined) {
+		const result = await api.commitNativeWindowsRecording(prepared.nativeWindowsArmedRecordingId);
+		if (!result.success) {
+			throw new Error(
+				result.error ?? `Failed to commit win32 recording for layer ${target.layerId}.`,
+			);
+		}
+		const path = prepared.nativeWindowsArmedPath ?? result.path;
+		if (!path) {
+			throw new Error(
+				`win32 recording for layer ${target.layerId} returned no output path on commit.`,
+			);
+		}
+		return { screenVideoPath: path };
+	}
+
+	// Fallback (mac, or win32 without prepare): original one-shot start.
 	const request = {
 		...target.request,
 		recordingId: target.recordingId,
@@ -261,45 +387,110 @@ function aggregateLayerErrors(
 }
 
 /**
- * Start N native recordings in parallel. On any failure, the orchestrator
- * attempts to stop already-started helpers with `discard: true` so we
- * don't leak running processes, then rethrows the aggregate error.
+ * Prepare N layers in parallel. Each layer's prepare phase runs
+ * concurrently so the slowest one bounds the wall-clock cost. Failures
+ * roll back any successful prepares so we don't leak handles.
  */
-export async function startMultiSourceRecording(
+export async function prepareMultiSourceRecording(
 	targets: MultiSourceTarget[],
 	options?: { sessionId?: string },
-): Promise<MultiSourceRecordingHandle> {
+): Promise<PreparedMultiSourceRecording> {
 	if (targets.length === 0) {
-		throw new Error("startMultiSourceRecording requires at least one target.");
+		throw new Error("prepareMultiSourceRecording requires at least one target.");
 	}
 
 	const sessionId = options?.sessionId ?? newSessionId();
 	const layerIds = targets.map((t) => t.layerId);
 
-	const startResults = await Promise.allSettled(targets.map((target) => startOneTarget(target)));
+	const prepareResults = await Promise.allSettled(
+		targets.map((target) => prepareOneTarget(target)),
+	);
 
-	const success: ActiveLayerState[] = [];
+	const prepared: PreparedLayerState[] = [];
 	const failureIndices: number[] = [];
-	for (let i = 0; i < startResults.length; i++) {
-		const result = startResults[i];
+	for (let i = 0; i < prepareResults.length; i++) {
+		const result = prepareResults[i];
 		if (result.status === "fulfilled") {
-			success.push({
-				target: targets[i],
-				screenVideoPath: result.value.screenVideoPath,
-				displayMediaHandle: result.value.displayMediaHandle,
-			});
+			prepared.push(result.value);
 		} else {
 			failureIndices.push(i);
 		}
 	}
 
 	if (failureIndices.length > 0) {
-		// Roll back any that did start so we don't leak helpers.
-		await Promise.allSettled(success.map((s) => stopOneTarget(s, { discard: true })));
-		throw aggregateLayerErrors(startResults, "start") ?? new Error("Multi-source start failed.");
+		for (const p of prepared) discardOneTarget(p);
+		throw (
+			aggregateLayerErrors(prepareResults, "prepare") ?? new Error("Multi-source prepare failed.")
+		);
 	}
 
-	return makeHandle(sessionId, layerIds, success);
+	let consumed = false;
+
+	return {
+		sessionId,
+		layerIds,
+		async commit() {
+			if (consumed) throw new Error("PreparedMultiSourceRecording already consumed.");
+			consumed = true;
+
+			const commitResults = await Promise.allSettled(prepared.map((p) => commitOneTarget(p)));
+
+			const success: ActiveLayerState[] = [];
+			const commitFailureIndices: number[] = [];
+			for (let i = 0; i < commitResults.length; i++) {
+				const result = commitResults[i];
+				if (result.status === "fulfilled") {
+					success.push({
+						target: prepared[i].target,
+						screenVideoPath: result.value.screenVideoPath,
+						displayMediaHandle: result.value.displayMediaHandle,
+					});
+				} else {
+					commitFailureIndices.push(i);
+				}
+			}
+
+			if (commitFailureIndices.length > 0) {
+				// Roll back any that did commit + discard any prepared but
+				// uncommitted display-media streams.
+				await Promise.allSettled(success.map((s) => stopOneTarget(s, { discard: true })));
+				for (let i = 0; i < prepared.length; i++) {
+					if (commitResults[i].status === "rejected") {
+						discardOneTarget(prepared[i]);
+					}
+				}
+				throw (
+					aggregateLayerErrors(commitResults, "commit") ?? new Error("Multi-source commit failed.")
+				);
+			}
+
+			return makeHandle(sessionId, layerIds, success);
+		},
+		async discard() {
+			if (consumed) return;
+			consumed = true;
+			for (const p of prepared) discardOneTarget(p);
+		},
+	};
+}
+
+/**
+ * One-shot start: prepare + commit in sequence. Existing call sites that
+ * do not want pre-warm semantics keep using this.
+ */
+export async function startMultiSourceRecording(
+	targets: MultiSourceTarget[],
+	options?: { sessionId?: string },
+): Promise<MultiSourceRecordingHandle> {
+	const prepared = await prepareMultiSourceRecording(targets, options);
+	try {
+		return await prepared.commit();
+	} catch (error) {
+		await prepared.discard().catch(() => {
+			// Best-effort cleanup; rethrow the original commit error.
+		});
+		throw error;
+	}
 }
 
 function makeHandle(

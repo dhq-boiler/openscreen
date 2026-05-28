@@ -130,6 +130,18 @@ interface Window {
 		startNativeWindowsRecording: (
 			request: import("../src/lib/nativeWindowsRecording").NativeWindowsRecordingRequest,
 		) => Promise<import("../src/lib/nativeWindowsRecording").NativeWindowsRecordingStartResult>;
+		// Phase B: two-stage start. `prepare` spawns the helper with armed
+		// init; `commit` sends the stdin "start" command and waits for the
+		// "Recording started" ack.
+		prepareNativeWindowsRecording: (
+			request: import("../src/lib/nativeWindowsRecording").NativeWindowsRecordingRequest,
+		) => Promise<import("../src/lib/nativeWindowsRecording").NativeWindowsRecordingStartResult>;
+		commitNativeWindowsRecording: (recordingId: number) => Promise<{
+			success: boolean;
+			recordingId?: number;
+			path?: string;
+			error?: string;
+		}>;
 		stopNativeWindowsRecording: (
 			discardOrOptions?: boolean | { discard?: boolean; recordingId?: number },
 		) => Promise<{

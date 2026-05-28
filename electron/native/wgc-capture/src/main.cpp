@@ -49,6 +49,12 @@ struct CaptureConfig {
     int webcamWidth = 0;
     int webcamHeight = 0;
     int webcamFps = 0;
+    // Phase B: when true, the helper completes init then blocks on stdin
+    // for a "start" command before launching the capture loop. Lets the
+    // orchestrator hide WGC + Media Foundation warmup behind the user's
+    // record countdown so the moment of record-start no longer spikes
+    // the GPU. Default false keeps the legacy one-shot behaviour intact.
+    bool armedStart = false;
 };
 
 struct CaptureControl {
@@ -338,6 +344,7 @@ bool parseConfig(const std::string& json, CaptureConfig& config) {
     config.captureMic = findBool(json, "captureMic", false);
     config.captureCursor = findBool(json, "captureCursor", false);
     config.webcamEnabled = findBool(json, "webcamEnabled", false);
+    config.armedStart = findBool(json, "armedStart", false);
     config.microphoneDeviceId = findString(json, "microphoneDeviceId");
     config.microphoneDeviceName = findString(json, "microphoneDeviceName");
     config.microphoneGain = findDouble(json, "microphoneGain", 1.0);
@@ -969,6 +976,38 @@ int main(int argc, char* argv[]) {
         if (!hasVisibleWebcamFrame) {
             std::cerr << "WARNING: Native webcam started but no visible frame was available before screen capture"
                       << std::endl;
+        }
+    }
+
+    // Phase B: in armed-start mode, init is complete but we hold off on
+    // the WGC capture loop until the orchestrator gives the go-ahead via
+    // stdin. The "armed" event tells the main process that prepare is
+    // done and the helper is now waiting for "start". A "discard"/"quit"
+    // here lets a cancelled countdown shut us down without ever calling
+    // session.start(), so no output file gets created.
+    if (config.armedStart) {
+        std::cout << "{\"event\":\"armed\",\"schemaVersion\":2}" << std::endl;
+        std::string line;
+        bool gotStart = false;
+        while (std::getline(std::cin, line)) {
+            if (line == "start") {
+                gotStart = true;
+                break;
+            }
+            if (line == "discard" || line == "stop" || line == "q" || line == "quit") {
+                webcamCapture.stop();
+                microphoneCapture.stop();
+                loopbackCapture.stop();
+                return 0;
+            }
+            // Unknown command while armed — ignore and keep waiting.
+        }
+        if (!gotStart) {
+            // stdin closed before a start arrived — exit cleanly.
+            webcamCapture.stop();
+            microphoneCapture.stop();
+            loopbackCapture.stop();
+            return 0;
         }
     }
 

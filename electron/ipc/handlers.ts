@@ -1006,6 +1006,54 @@ function waitForNativeWindowsCaptureStart(session: NativeWindowsCaptureSession) 
 	});
 }
 
+/**
+ * Phase B: wait for the helper's "armed" event. Used by the prepare IPC
+ * to ack that WGC + Media Foundation init finished and the helper is
+ * blocked on stdin waiting for a "start" command.
+ */
+function waitForNativeWindowsCaptureArmed(session: NativeWindowsCaptureSession) {
+	const proc = session.process;
+	return new Promise<void>((resolve, reject) => {
+		const timer = setTimeout(() => {
+			cleanup();
+			reject(new Error("Timed out waiting for native Windows capture to arm"));
+		}, 12000);
+
+		const onOutput = (chunk: Buffer) => {
+			session.output += chunk.toString();
+			if (session.output.includes('"event":"armed"')) {
+				cleanup();
+				resolve();
+			}
+		};
+		const onError = (error: Error) => {
+			cleanup();
+			reject(error);
+		};
+		const onExit = (code: number | null) => {
+			cleanup();
+			reject(
+				new Error(
+					session.output.trim() ||
+						`Native Windows capture exited before arm (code=${code ?? "unknown"})`,
+				),
+			);
+		};
+		const cleanup = () => {
+			clearTimeout(timer);
+			proc.stdout.off("data", onOutput);
+			proc.stderr.off("data", onOutput);
+			proc.off("error", onError);
+			proc.off("exit", onExit);
+		};
+
+		proc.stdout.on("data", onOutput);
+		proc.stderr.on("data", onOutput);
+		proc.once("error", onError);
+		proc.once("exit", onExit);
+	});
+}
+
 function waitForNativeWindowsCaptureStop(session: NativeWindowsCaptureSession) {
 	const proc = session.process;
 	return new Promise<string>((resolve, reject) => {
@@ -1871,6 +1919,242 @@ export function registerIpcHandlers(
 			}
 		},
 	);
+
+	// Phase B: pre-warm path. Spawns the helper with `armedStart: true` so
+	// WGC + Media Foundation + audio + webcam all initialise during the
+	// caller's countdown. The helper then blocks on stdin until
+	// `commit-native-windows-recording` writes "start". This lets the
+	// 330ms init spike land while the user is watching "3-2-1" instead of
+	// at the moment they expect recording to begin.
+	ipcMain.handle(
+		"prepare-native-windows-recording",
+		async (_, request: NativeWindowsRecordingRequest) => {
+			let createdSessionId: number | null = null;
+			try {
+				if (!isWindowsGraphicsCaptureOsSupported()) {
+					return {
+						success: false,
+						error: "Windows Graphics Capture requires Windows 10 build 19041 or newer.",
+					};
+				}
+
+				const hasExplicitRecordingId =
+					typeof request.recordingId === "number" && Number.isFinite(request.recordingId);
+				if (!hasExplicitRecordingId && nativeWindowsCaptures.size > 0) {
+					return { success: false, error: "Native Windows capture is already running." };
+				}
+				if (hasExplicitRecordingId && nativeWindowsCaptures.has(request.recordingId as number)) {
+					return {
+						success: false,
+						error: `Native Windows capture is already running for recordingId ${request.recordingId}.`,
+					};
+				}
+
+				const helperPath = await findNativeWindowsCaptureHelperPath();
+				if (!helperPath) {
+					return { success: false, error: "Native Windows capture helper is not available." };
+				}
+
+				if (!request?.source?.sourceId) {
+					return {
+						success: false,
+						error: "Native Windows capture request is missing a source.",
+					};
+				}
+
+				const recordingId =
+					typeof request.recordingId === "number" && Number.isFinite(request.recordingId)
+						? request.recordingId
+						: Date.now();
+				const outputPath = path.join(RECORDINGS_DIR, `${RECORDING_FILE_PREFIX}${recordingId}.mp4`);
+				const webcamOutputPath = path.join(
+					RECORDINGS_DIR,
+					`${RECORDING_FILE_PREFIX}${recordingId}-webcam.mp4`,
+				);
+				const sourceDisplay =
+					request.source.type === "display" && typeof request.source.displayId === "number"
+						? (screen.getAllDisplays().find((display) => display.id === request.source.displayId) ??
+							null)
+						: getSelectedDisplay();
+				const bounds = sourceDisplay?.bounds ?? getSelectedSourceBounds();
+				const displayId =
+					typeof request.source.displayId === "number" && Number.isFinite(request.source.displayId)
+						? request.source.displayId
+						: Number(selectedSource?.display_id);
+				const webcamDirectShowClsid = request.webcam.enabled
+					? await resolveDirectShowWebcamClsid(request.webcam.deviceName)
+					: null;
+				const cursorCaptureMode =
+					normalizeCursorCaptureMode(request.cursor?.mode) ?? "editable-overlay";
+				const config = {
+					schemaVersion: 2,
+					recordingId,
+					outputPath,
+					sourceType: request.source.type,
+					sourceId: request.source.sourceId,
+					displayId: Number.isFinite(displayId) ? displayId : 0,
+					windowHandle: request.source.windowHandle ?? null,
+					fps: request.video.fps,
+					videoWidth: request.video.width,
+					videoHeight: request.video.height,
+					displayX: bounds.x,
+					displayY: bounds.y,
+					displayW: bounds.width,
+					displayH: bounds.height,
+					hasDisplayBounds: true,
+					captureSystemAudio: request.audio.system.enabled,
+					captureMic: request.audio.microphone.enabled,
+					microphoneDeviceId: request.audio.microphone.deviceId ?? null,
+					microphoneDeviceName: request.audio.microphone.deviceName ?? null,
+					microphoneGain: request.audio.microphone.gain,
+					webcamEnabled: request.webcam.enabled,
+					webcamDeviceId: request.webcam.deviceId ?? null,
+					webcamDeviceName: request.webcam.deviceName ?? null,
+					webcamDirectShowClsid,
+					webcamWidth: request.webcam.width,
+					webcamHeight: request.webcam.height,
+					webcamFps: request.webcam.fps,
+					captureCursor: cursorCaptureMode === "system",
+					cursorCaptureMode,
+					armedStart: true,
+					outputs: {
+						screenPath: outputPath,
+						webcamPath: webcamOutputPath,
+					},
+					source: {
+						type: request.source.type,
+						sourceId: request.source.sourceId,
+						displayId: Number.isFinite(displayId) ? displayId : null,
+						windowHandle: request.source.windowHandle ?? null,
+						bounds,
+					},
+					video: request.video,
+					audio: request.audio,
+					webcam: request.webcam,
+					cursor: {
+						mode: cursorCaptureMode,
+					},
+				};
+
+				console.info("[native-wgc] preparing Windows capture (armed)", {
+					helperPath,
+					source: request.source,
+					recordingId,
+				});
+
+				await fs.mkdir(RECORDINGS_DIR, { recursive: true });
+
+				const cursorStartTimeMs = Date.now();
+				if (cursorCaptureMode === "editable-overlay") {
+					await startCursorRecording(cursorStartTimeMs);
+					console.info("[native-wgc] cursor sampler ready", {
+						cursorStartTimeMs,
+						warmupMs: Date.now() - cursorStartTimeMs,
+					});
+				} else {
+					pendingCursorRecordingData = null;
+				}
+
+				const proc = spawn(helperPath, [JSON.stringify(config)], {
+					cwd: RECORDINGS_DIR,
+					stdio: ["pipe", "pipe", "pipe"],
+					windowsHide: true,
+				});
+
+				const session: NativeWindowsCaptureSession = {
+					recordingId,
+					process: proc,
+					output: "",
+					targetPath: outputPath,
+					webcamTargetPath: request.webcam.enabled ? webcamOutputPath : null,
+					cursorOffsetMs: 0,
+					cursorCaptureMode,
+					cursorRecordingStartMs: cursorCaptureMode === "editable-overlay" ? cursorStartTimeMs : 0,
+					pauseStartedAtMs: null,
+					pauseRanges: [],
+					isPaused: false,
+				};
+				nativeWindowsCaptures.set(recordingId, session);
+				createdSessionId = recordingId;
+
+				await waitForNativeWindowsCaptureArmed(session);
+				console.info("[native-wgc] capture armed (awaiting commit)", { recordingId });
+
+				return {
+					success: true,
+					recordingId,
+					path: outputPath,
+					helperPath,
+				};
+			} catch (error) {
+				console.error("Failed to prepare native Windows recording:", error);
+				if (createdSessionId !== null) {
+					const session = nativeWindowsCaptures.get(createdSessionId);
+					session?.process.kill();
+					nativeWindowsCaptures.delete(createdSessionId);
+				}
+				await stopCursorRecording();
+				return { success: false, error: String(error) };
+			}
+		},
+	);
+
+	// Phase B: commit an already-prepared (armed) helper. Sends "start"
+	// via stdin, waits for the helper to acknowledge with the
+	// "Recording started" event, then runs the same post-wait bookkeeping
+	// (cursor offset, webcam format read, recording-state callback) that
+	// the one-shot start handler does.
+	ipcMain.handle("commit-native-windows-recording", async (_, recordingId: number) => {
+		try {
+			if (typeof recordingId !== "number" || !Number.isFinite(recordingId)) {
+				return { success: false, error: "commit requires a numeric recordingId" };
+			}
+			const session = nativeWindowsCaptures.get(recordingId);
+			if (!session) {
+				return {
+					success: false,
+					error: `No armed native Windows capture for recordingId ${recordingId}`,
+				};
+			}
+
+			const stdin = session.process.stdin;
+			if (!stdin || stdin.destroyed) {
+				return {
+					success: false,
+					error: `Native Windows capture stdin is unavailable for recordingId ${recordingId}`,
+				};
+			}
+			stdin.write("start\n");
+
+			await waitForNativeWindowsCaptureStart(session);
+			const captureStartedAtMs = Date.now();
+			session.cursorOffsetMs =
+				session.cursorCaptureMode === "editable-overlay"
+					? Math.max(0, captureStartedAtMs - session.cursorRecordingStartMs)
+					: 0;
+			const webcamFormat = readNativeWindowsWebcamFormat(session.output);
+			console.info("[native-wgc] capture committed", {
+				recordingId,
+				captureStartedAtMs,
+				cursorOffsetMs: session.cursorOffsetMs,
+				webcamFormat,
+			});
+
+			const source = selectedSource || { name: "Screen" };
+			if (onRecordingStateChange) {
+				onRecordingStateChange(true, source.name);
+			}
+
+			return {
+				success: true,
+				recordingId,
+				path: session.targetPath,
+			};
+		} catch (error) {
+			console.error("Failed to commit native Windows recording:", error);
+			return { success: false, error: String(error) };
+		}
+	});
 
 	ipcMain.handle("start-native-mac-recording", async (_, request: NativeMacRecordingRequest) => {
 		let createdSessionId: number | null = null;

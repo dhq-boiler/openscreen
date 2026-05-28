@@ -18,6 +18,21 @@ export interface DisplayMediaWindowCaptureHandle {
 	resume: () => void;
 }
 
+/**
+ * Result of {@link prepareDisplayMediaWindowCapture}: the getUserMedia
+ * track and MediaRecorder are already alive, but the recorder is not
+ * recording yet. Caller must invoke `commit()` (starts the recorder) or
+ * `discard()` (releases the stream) before the prepared resources leak.
+ *
+ * `commit()` returns the same handle shape that
+ * {@link startDisplayMediaWindowCapture} produces, so downstream code that
+ * already speaks {@link DisplayMediaWindowCaptureHandle} stays unchanged.
+ */
+export interface PreparedDisplayMediaWindowCapture {
+	commit: () => DisplayMediaWindowCaptureHandle;
+	discard: () => void;
+}
+
 export interface DisplayMediaWindowCaptureOptions {
 	/** desktopCapturer source id (e.g. "window:12345:0") */
 	sourceId: string;
@@ -52,9 +67,19 @@ function pickSupportedMimeType(): string {
 	return "";
 }
 
-export async function startDisplayMediaWindowCapture(
+/**
+ * Acquire the desktop capture stream + create the MediaRecorder, but do
+ * not start it yet. The heavy work (getUserMedia handshake, codec setup)
+ * happens here so the caller can run it during the user-visible record
+ * countdown; calling `commit()` at countdown end just flips
+ * `recorder.start()`, which is cheap.
+ *
+ * `discard()` releases the stream without ever producing output — used
+ * when the user cancels the countdown.
+ */
+export async function prepareDisplayMediaWindowCapture(
 	options: DisplayMediaWindowCaptureOptions,
-): Promise<DisplayMediaWindowCaptureHandle> {
+): Promise<PreparedDisplayMediaWindowCapture> {
 	const videoConstraints = {
 		mandatory: {
 			chromeMediaSource: "desktop",
@@ -88,40 +113,67 @@ export async function startDisplayMediaWindowCapture(
 		};
 	});
 
-	// Request chunks every second so a crash mid-recording still leaves
-	// most of the timeline on disk after stop fires.
-	recorder.start(1000);
+	let consumed = false;
+
+	const stop = async () => {
+		if (recorder.state === "inactive") {
+			return { outputPath: "", mimeType };
+		}
+		recorder.stop();
+		await stopPromise;
+		stream.getTracks().forEach((track) => track.stop());
+
+		const effectiveType = mimeType || recorder.mimeType || "video/webm";
+		const blob = new Blob(chunks, { type: effectiveType });
+		const arrayBuffer = await blob.arrayBuffer();
+		const saved = await window.electronAPI.saveDisplayMediaRecording({
+			fileName: options.fileName,
+			data: arrayBuffer,
+		});
+		if (!saved.success || !saved.outputPath) {
+			throw new Error(saved.error ?? "save-display-media-recording failed");
+		}
+		return { outputPath: saved.outputPath, mimeType: effectiveType };
+	};
 
 	return {
-		stop: async () => {
-			if (recorder.state === "inactive") {
-				return { outputPath: "", mimeType };
+		commit() {
+			if (consumed) {
+				throw new Error("PreparedDisplayMediaWindowCapture already consumed");
 			}
-			recorder.stop();
-			await stopPromise;
+			consumed = true;
+			// Request chunks every second so a crash mid-recording still leaves
+			// most of the timeline on disk after stop fires.
+			recorder.start(1000);
+			return {
+				stop,
+				pause: () => {
+					if (recorder.state === "recording") {
+						recorder.pause();
+					}
+				},
+				resume: () => {
+					if (recorder.state === "paused") {
+						recorder.resume();
+					}
+				},
+			};
+		},
+		discard() {
+			if (consumed) return;
+			consumed = true;
 			stream.getTracks().forEach((track) => track.stop());
-
-			const effectiveType = mimeType || recorder.mimeType || "video/webm";
-			const blob = new Blob(chunks, { type: effectiveType });
-			const arrayBuffer = await blob.arrayBuffer();
-			const saved = await window.electronAPI.saveDisplayMediaRecording({
-				fileName: options.fileName,
-				data: arrayBuffer,
-			});
-			if (!saved.success || !saved.outputPath) {
-				throw new Error(saved.error ?? "save-display-media-recording failed");
-			}
-			return { outputPath: saved.outputPath, mimeType: effectiveType };
-		},
-		pause: () => {
-			if (recorder.state === "recording") {
-				recorder.pause();
-			}
-		},
-		resume: () => {
-			if (recorder.state === "paused") {
-				recorder.resume();
-			}
 		},
 	};
+}
+
+/**
+ * Convenience one-shot that combines prepare + commit. Kept so existing
+ * call sites that do not need pre-warm semantics don't have to change.
+ */
+export async function startDisplayMediaWindowCapture(
+	options: DisplayMediaWindowCaptureOptions,
+): Promise<DisplayMediaWindowCaptureHandle> {
+	const prepared = await prepareDisplayMediaWindowCapture(options);
+	return prepared.commit();
 }

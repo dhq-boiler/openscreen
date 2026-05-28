@@ -98,6 +98,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	startNativeWindowsRecording: (request: NativeWindowsRecordingRequest) => {
 		return ipcRenderer.invoke("start-native-windows-recording", request);
 	},
+	prepareNativeWindowsRecording: (request: NativeWindowsRecordingRequest) => {
+		return ipcRenderer.invoke("prepare-native-windows-recording", request);
+	},
+	commitNativeWindowsRecording: (recordingId: number) => {
+		return ipcRenderer.invoke("commit-native-windows-recording", recordingId);
+	},
 	stopNativeWindowsRecording: (
 		discardOrOptions?: boolean | { discard?: boolean; recordingId?: number },
 	) => {

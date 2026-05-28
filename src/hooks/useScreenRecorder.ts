@@ -8,6 +8,8 @@ import {
 	newLayerId,
 	newRecordingId,
 	newSessionId,
+	type PreparedMultiSourceRecording,
+	prepareMultiSourceRecording,
 	startMultiSourceRecording,
 } from "@/lib/multiSourceRecording";
 import {
@@ -144,6 +146,12 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	// stop/pause/resume paths route through the orchestrator instead of the
 	// per-session refs above.
 	const multiSourceRecording = useRef<MultiSourceRecordingHandle | null>(null);
+	// Phase A pre-warm: the prepared multi-source recording (resources held
+	// open during the 3-2-1 countdown). `start*` consumes this on countdown
+	// end; cancellation paths call `.discard()` and null these out.
+	const multiSourcePrepared = useRef<PreparedMultiSourceRecording | null>(null);
+	const multiSourcePreparedRunId = useRef<number | null>(null);
+	const multiSourcePreparedBaseRecordingId = useRef<number | null>(null);
 	const stream = useRef<MediaStream | null>(null);
 	const screenStream = useRef<MediaStream | null>(null);
 	const microphoneStream = useRef<MediaStream | null>(null);
@@ -740,6 +748,16 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			}
 			screenRecorder.current = null;
 			webcamRecorder.current = null;
+			// Phase A: discard any pre-warmed multi-source handles on unmount
+			// so streams and helpers don't outlive the hook.
+			if (multiSourcePrepared.current) {
+				void multiSourcePrepared.current.discard().catch(() => {
+					// Best-effort cleanup on unmount; ignore failures.
+				});
+				multiSourcePrepared.current = null;
+				multiSourcePreparedRunId.current = null;
+				multiSourcePreparedBaseRecordingId.current = null;
+			}
 			teardownMedia();
 		};
 	}, [
@@ -764,6 +782,16 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 		countdownRunId.current += 1;
 		setCountdownActive(false);
 		void safeHideCountdownOverlay(activeRunId);
+		// Phase A: tear down any pre-warmed multi-source resources that
+		// the cancelled countdown left behind.
+		if (multiSourcePrepared.current) {
+			void multiSourcePrepared.current.discard().catch(() => {
+				// Best-effort cleanup; nothing left to report to the user.
+			});
+			multiSourcePrepared.current = null;
+			multiSourcePreparedRunId.current = null;
+			multiSourcePreparedBaseRecordingId.current = null;
+		}
 	};
 
 	const safeSetCountdownOverlayValue = async (value: number, runId: number) => {
@@ -853,35 +881,15 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	 * via the orchestrator, and stores the handle so stop/pause/resume can
 	 * fan out across all layers. Returns true if it handled the session.
 	 */
-	const startMultiSourceIfMultiSelected = async (
+	/**
+	 * Build the per-source target list. Extracted so the pre-warm (prepare)
+	 * path and the one-shot (start) fallback share a single source of truth
+	 * for how requests are constructed.
+	 */
+	const buildMultiSourceTargets = (
 		selectedSources: ProcessedDesktopSource[],
-		countdownRunToken?: number,
-	): Promise<boolean> => {
-		if (selectedSources.length < 2) return false;
-
-		const platform = await window.electronAPI.getPlatform();
-		if (platform !== "win32" && platform !== "darwin") return false;
-
-		// We currently require native helpers for multi-source. Browser
-		// MediaRecorder is single-source per getDisplayMedia call and
-		// composing N getDisplayMedia streams in the renderer is a Phase 6
-		// optimization, not a Phase 2 requirement.
-		if (platform === "win32") {
-			const availability = await window.electronAPI.isNativeWindowsCaptureAvailable();
-			if (!availability.success || !availability.available) {
-				toast.error("Multi-window recording requires the native Windows capture helper.");
-				return false;
-			}
-		} else {
-			const availability = await window.electronAPI.isNativeMacCaptureAvailable();
-			if (!availability.success || !availability.available) {
-				toast.error("Multi-window recording requires the native macOS capture helper.");
-				return false;
-			}
-		}
-
-		if (!isCountdownRunActive(countdownRunToken)) return true;
-
+		platform: "win32" | "darwin",
+	): { sessionId: string; baseRecordingId: number; targets: MultiSourceTarget[] } => {
 		const sessionId = newSessionId();
 		const baseRecordingId = newRecordingId();
 		const targets: MultiSourceTarget[] = selectedSources.map((source, index) => {
@@ -1011,6 +1019,130 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				request,
 			};
 		});
+
+		return { sessionId, baseRecordingId, targets };
+	};
+
+	/**
+	 * Phase A pre-warm: kick off `prepareMultiSourceRecording` while the
+	 * 3-2-1 countdown plays. Stores the prepared handle in refs so the
+	 * commit phase (running inside `startMultiSourceIfMultiSelected` at
+	 * countdown end) can flip it into a recording without paying the
+	 * getUserMedia / WGC init cost twice. Cancellations during the
+	 * countdown invalidate the prepared handle via `discard()`.
+	 */
+	const prepareMultiSourceIfMultiSelected = async (
+		selectedSources: ProcessedDesktopSource[],
+		countdownRunToken: number,
+	): Promise<void> => {
+		if (selectedSources.length < 2) return;
+
+		try {
+			const platform = await window.electronAPI.getPlatform();
+			if (platform !== "win32" && platform !== "darwin") return;
+
+			if (platform === "win32") {
+				const availability = await window.electronAPI.isNativeWindowsCaptureAvailable();
+				if (!availability.success || !availability.available) return;
+			} else {
+				const availability = await window.electronAPI.isNativeMacCaptureAvailable();
+				if (!availability.success || !availability.available) return;
+			}
+
+			if (!isCountdownRunActive(countdownRunToken)) return;
+
+			const { sessionId, baseRecordingId, targets } = buildMultiSourceTargets(
+				selectedSources,
+				platform,
+			);
+
+			const prepared = await prepareMultiSourceRecording(targets, { sessionId });
+
+			if (!isCountdownRunActive(countdownRunToken)) {
+				await prepared.discard().catch(() => {
+					// Best-effort cleanup after race-loss; ignore failures.
+				});
+				return;
+			}
+
+			multiSourcePrepared.current = prepared;
+			multiSourcePreparedRunId.current = countdownRunToken;
+			multiSourcePreparedBaseRecordingId.current = baseRecordingId;
+		} catch (error) {
+			// Don't toast — the countdown is still running for the user.
+			// If commit also fails, that path surfaces the error.
+			console.error("Failed to prepare multi-source recording:", error);
+		}
+	};
+
+	const startMultiSourceIfMultiSelected = async (
+		selectedSources: ProcessedDesktopSource[],
+		countdownRunToken?: number,
+	): Promise<boolean> => {
+		if (selectedSources.length < 2) return false;
+
+		// Phase A: consume the pre-warmed handle if the countdown matches.
+		// `multiSourcePreparedRunId` only matches when the prepare and the
+		// current startRecording share the same countdown cycle.
+		if (
+			multiSourcePrepared.current !== null &&
+			countdownRunToken !== undefined &&
+			multiSourcePreparedRunId.current === countdownRunToken &&
+			multiSourcePreparedBaseRecordingId.current !== null
+		) {
+			const prepared = multiSourcePrepared.current;
+			const baseRecordingId = multiSourcePreparedBaseRecordingId.current;
+			multiSourcePrepared.current = null;
+			multiSourcePreparedRunId.current = null;
+			multiSourcePreparedBaseRecordingId.current = null;
+			try {
+				const handle = await prepared.commit();
+				multiSourceRecording.current = handle;
+
+				setRecording(true);
+				setPaused(false);
+				recordingId.current = baseRecordingId;
+				accumulatedDurationMs.current = 0;
+				segmentStartedAt.current = Date.now();
+				setElapsedSeconds(0);
+				allowAutoFinalize.current = true;
+				return true;
+			} catch (error) {
+				console.error("Failed to commit multi-source recording:", error);
+				toast.error(
+					`Multi-window recording failed to start: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+				return true;
+			}
+		}
+
+		// Fallback: no prepared handle (race-loss, single-source upgrade, or
+		// prepare failed silently). Run the original one-shot start.
+		const platform = await window.electronAPI.getPlatform();
+		if (platform !== "win32" && platform !== "darwin") return false;
+
+		if (platform === "win32") {
+			const availability = await window.electronAPI.isNativeWindowsCaptureAvailable();
+			if (!availability.success || !availability.available) {
+				toast.error("Multi-window recording requires the native Windows capture helper.");
+				return false;
+			}
+		} else {
+			const availability = await window.electronAPI.isNativeMacCaptureAvailable();
+			if (!availability.success || !availability.available) {
+				toast.error("Multi-window recording requires the native macOS capture helper.");
+				return false;
+			}
+		}
+
+		if (!isCountdownRunActive(countdownRunToken)) return true;
+
+		const { sessionId, baseRecordingId, targets } = buildMultiSourceTargets(
+			selectedSources,
+			platform,
+		);
 
 		try {
 			const handle = await startMultiSourceRecording(targets, { sessionId });
@@ -1339,6 +1471,23 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 		}
 
 		setCountdownActive(true);
+
+		// Phase A: kick off multi-source prepare in parallel with the
+		// 3-2-1 countdown. The heavy getUserMedia + MediaRecorder init
+		// (display-media layers) — and later, Phase B's native WGC + MF
+		// init — completes during the countdown so the user-visible
+		// "record start" only pays for `recorder.start()`, not for
+		// codec / capture-session warmup.
+		void (async () => {
+			try {
+				const sources = await window.electronAPI.getSelectedSources();
+				if (sources.length > 1) {
+					await prepareMultiSourceIfMultiSelected(sources, runId);
+				}
+			} catch (error) {
+				console.warn("Failed to kick off multi-source prepare:", error);
+			}
+		})();
 
 		let overlayHiddenBeforeStart = false;
 		try {
