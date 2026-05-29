@@ -227,7 +227,26 @@ bool MFEncoder::copyFrameToBuffer(
         return false;
     }
 
-    context_->CopyResource(stagingTexture_.Get(), texture);
+    // The staging texture is sized to the encoder's even-rounded width_/height_,
+    // but the source WGC texture keeps the capture item's raw size (the window
+    // dimensions, which are frequently odd). ID3D11DeviceContext::CopyResource
+    // requires byte-identical resources and silently no-ops on a size mismatch,
+    // which left every odd-sized window recording as a black frame. Copy the
+    // top-left width_ x height_ region explicitly so any size difference is
+    // handled instead of dropped. Source dims are always >= staging dims because
+    // the encoder only ever rounds the size down.
+    D3D11_TEXTURE2D_DESC sourceDesc{};
+    texture->GetDesc(&sourceDesc);
+    const UINT copyWidth = std::min(static_cast<UINT>(width_), sourceDesc.Width);
+    const UINT copyHeight = std::min(static_cast<UINT>(height_), sourceDesc.Height);
+    D3D11_BOX sourceBox{};
+    sourceBox.left = 0;
+    sourceBox.top = 0;
+    sourceBox.front = 0;
+    sourceBox.right = copyWidth;
+    sourceBox.bottom = copyHeight;
+    sourceBox.back = 1;
+    context_->CopySubresourceRegion(stagingTexture_.Get(), 0, 0, 0, 0, texture, 0, &sourceBox);
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (!succeeded(context_->Map(stagingTexture_.Get(), 0, D3D11_MAP_READ, 0, &mapped), "Map")) {

@@ -43,6 +43,7 @@ target_compile_options(wgc-capture PRIVATE /EHsc /W4 /utf-8)
 
 target_link_libraries(wgc-capture PRIVATE
   d3d11
+  dwmapi
   dxgi
   mf
   mfplat

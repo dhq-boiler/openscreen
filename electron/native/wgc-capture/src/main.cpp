@@ -7,6 +7,8 @@
 
 #include <winrt/Windows.Foundation.h>
 
+#include <dwmapi.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -567,40 +569,114 @@ int main(int argc, char* argv[]) {
         if (!hwnd || width <= 0 || height <= 0) {
             return false;
         }
+
+        // PrintWindow always renders from the window's TRUE top-left, which
+        // includes the invisible resize border (~7px on Win10/11). WGC, by
+        // contrast, only captures the visible frame
+        // (DWMWA_EXTENDED_FRAME_BOUNDS). Printing straight into a
+        // capture-sized buffer therefore shifts the content right and leaves a
+        // black band on the left edge. To stay aligned with the real WGC
+        // frames we print into a full-window-sized intermediate, then crop the
+        // visible frame out into the capture-sized output buffer.
+        RECT winRect{};
+        if (!GetWindowRect(hwnd, &winRect)) {
+            return false;
+        }
+        const int fullW = winRect.right - winRect.left;
+        const int fullH = winRect.bottom - winRect.top;
+        if (fullW <= 0 || fullH <= 0) {
+            return false;
+        }
+
+        // frameRect is in screen coordinates and matches the region WGC
+        // captures. The offset of its top-left inside the full window rect is
+        // the invisible border we must skip when cropping the printed buffer.
+        RECT frameRect{};
+        int visX = 0;
+        int visY = 0;
+        int visW = fullW;
+        int visH = fullH;
+        const bool haveFrameBounds = SUCCEEDED(DwmGetWindowAttribute(
+            hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frameRect, sizeof(frameRect)));
+        if (haveFrameBounds) {
+            visX = std::max<LONG>(0, frameRect.left - winRect.left);
+            visY = std::max<LONG>(0, frameRect.top - winRect.top);
+            const int fw = frameRect.right - frameRect.left;
+            const int fh = frameRect.bottom - frameRect.top;
+            if (fw > 0 && fh > 0) {
+                visW = std::min(fw, fullW - visX);
+                visH = std::min(fh, fullH - visY);
+            }
+        }
+
         HDC screenDC = GetDC(nullptr);
         if (!screenDC) {
             return false;
         }
-        HDC memDC = CreateCompatibleDC(screenDC);
-        if (!memDC) {
-            ReleaseDC(nullptr, screenDC);
-            return false;
-        }
-        BITMAPINFO bmi{};
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = width;
-        // Negative height => top-down DIB so the rows match D3D11 / WGC layout.
-        bmi.bmiHeader.biHeight = -height;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        void* bits = nullptr;
-        HBITMAP bmp = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-        if (!bmp || !bits) {
-            if (bmp) {
-                DeleteObject(bmp);
+        HDC pwDC = CreateCompatibleDC(screenDC);
+        HDC outDC = CreateCompatibleDC(screenDC);
+        if (!pwDC || !outDC) {
+            if (pwDC) {
+                DeleteDC(pwDC);
             }
-            DeleteDC(memDC);
+            if (outDC) {
+                DeleteDC(outDC);
+            }
             ReleaseDC(nullptr, screenDC);
             return false;
         }
-        HGDIOBJ oldObj = SelectObject(memDC, bmp);
+
+        // Negative height => top-down DIB so the rows match D3D11 / WGC layout.
+        auto makeDib = [&](int w, int h, void** bitsOut) -> HBITMAP {
+            BITMAPINFO bmi{};
+            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth = w;
+            bmi.bmiHeader.biHeight = -h;
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            return CreateDIBSection(screenDC, &bmi, DIB_RGB_COLORS, bitsOut, nullptr, 0);
+        };
+
+        void* pwBits = nullptr;
+        void* outBits = nullptr;
+        HBITMAP pwBmp = makeDib(fullW, fullH, &pwBits);
+        HBITMAP outBmp = makeDib(width, height, &outBits);
+        if (!pwBmp || !pwBits || !outBmp || !outBits) {
+            if (pwBmp) {
+                DeleteObject(pwBmp);
+            }
+            if (outBmp) {
+                DeleteObject(outBmp);
+            }
+            DeleteDC(pwDC);
+            DeleteDC(outDC);
+            ReleaseDC(nullptr, screenDC);
+            return false;
+        }
+        HGDIOBJ oldPw = SelectObject(pwDC, pwBmp);
+        HGDIOBJ oldOut = SelectObject(outDC, outBmp);
+
         // PW_RENDERFULLCONTENT (0x00000002) is required for Chromium / DWM
         // composited windows; without it those targets often print as blank.
         // The macro ships in modern Windows SDKs but guard for older builds.
 #ifndef PW_RENDERFULLCONTENT
 #define PW_RENDERFULLCONTENT 0x00000002
 #endif
+
+        auto looksBlack = [](const void* bits, size_t byteCount) {
+            // Sample every 64th pixel — a full scan on a 4K frame is 33M bytes
+            // and runs every 500ms otherwise. Empty PrintWindow outputs are
+            // uniformly 0 so sparse sampling is enough.
+            const BYTE* p = static_cast<const BYTE*>(bits);
+            const size_t stride = 64 * 4;
+            for (size_t i = 0; i + 2 < byteCount; i += stride) {
+                if (p[i] != 0 || p[i + 1] != 0 || p[i + 2] != 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
 
         // WS_EX_COMPOSITED hack: temporarily flip on layered/composited
         // semantics so PrintWindow re-renders the target via the
@@ -609,58 +685,48 @@ int main(int argc, char* argv[]) {
         // windows. Restored immediately after PrintWindow finishes.
         const LONG_PTR oldExStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, oldExStyle | WS_EX_COMPOSITED);
-        PrintWindow(hwnd, memDC, PW_RENDERFULLCONTENT);
+        PrintWindow(hwnd, pwDC, PW_RENDERFULLCONTENT);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, oldExStyle);
 
-        const size_t byteCount = static_cast<size_t>(width) * height * 4;
-        auto bufferLooksBlack = [&]() {
-            // Sample every 64th pixel — full-window scan on a 4K frame is
-            // 33M bytes and runs every 500ms otherwise. Empty PrintWindow
-            // outputs are uniformly 0 so sparse sampling is enough.
-            const BYTE* p = static_cast<const BYTE*>(bits);
-            const size_t stride = 64 * 4;
-            for (size_t i = 0; i < byteCount; i += stride) {
-                if (p[i] != 0 || p[i + 1] != 0 || p[i + 2] != 0) {
-                    return false;
-                }
-            }
-            return true;
-        };
-
-        // BitBlt screen fallback: when PrintWindow comes back empty (either
-        // it returned FALSE or it returned TRUE with an all-zero buffer,
-        // which is the common WinUI 3 / Electron / DirectComposition
-        // failure mode), copy the on-screen pixels at the window's rect.
-        // This is the same workaround WebRTC's CroppingWindowCapturer uses.
-        // Trade-offs: requires the window to be visible on screen; if it's
-        // partially covered the overlapping window's pixels leak through.
+        const size_t outByteCount = static_cast<size_t>(width) * height * 4;
         bool ok = false;
-        if (!bufferLooksBlack()) {
-            ok = true;
-        } else {
-            RECT winRect{};
-            if (GetWindowRect(hwnd, &winRect)) {
-                const int winW = winRect.right - winRect.left;
-                const int winH = winRect.bottom - winRect.top;
-                if (winW > 0 && winH > 0) {
-                    SetStretchBltMode(memDC, HALFTONE);
-                    StretchBlt(memDC, 0, 0, width, height,
-                               screenDC, winRect.left, winRect.top, winW, winH, SRCCOPY);
-                    // Re-check after BitBlt: if the window was covered or
-                    // off-screen the result will still be black, in which
-                    // case there's nothing more we can do at this level.
-                    ok = !bufferLooksBlack();
-                }
+        SetStretchBltMode(outDC, HALFTONE);
+        if (!looksBlack(pwBits, static_cast<size_t>(fullW) * fullH * 4)) {
+            // Crop the visible frame out of the full-window render and scale it
+            // into the capture-sized output buffer. This drops the invisible
+            // resize border so the content stays aligned with real WGC frames.
+            StretchBlt(outDC, 0, 0, width, height,
+                       pwDC, visX, visY, visW, visH, SRCCOPY);
+            ok = !looksBlack(outBits, outByteCount);
+        }
+        if (!ok) {
+            // BitBlt screen fallback: when PrintWindow comes back empty (either
+            // it returned FALSE or it returned TRUE with an all-zero buffer,
+            // which is the common WinUI 3 / Electron / DirectComposition
+            // failure mode), copy the on-screen pixels at the visible frame
+            // rect. This is the same workaround WebRTC's CroppingWindowCapturer
+            // uses. Trade-offs: requires the window to be visible on screen; if
+            // it's partially covered the overlapping window's pixels leak in.
+            RECT srcRect = haveFrameBounds ? frameRect : winRect;
+            const int srcW = srcRect.right - srcRect.left;
+            const int srcH = srcRect.bottom - srcRect.top;
+            if (srcW > 0 && srcH > 0) {
+                StretchBlt(outDC, 0, 0, width, height,
+                           screenDC, srcRect.left, srcRect.top, srcW, srcH, SRCCOPY);
+                ok = !looksBlack(outBits, outByteCount);
             }
         }
 
         if (ok) {
-            printWindowBuffer.assign(static_cast<BYTE*>(bits),
-                                     static_cast<BYTE*>(bits) + byteCount);
+            printWindowBuffer.assign(static_cast<BYTE*>(outBits),
+                                     static_cast<BYTE*>(outBits) + outByteCount);
         }
-        SelectObject(memDC, oldObj);
-        DeleteObject(bmp);
-        DeleteDC(memDC);
+        SelectObject(pwDC, oldPw);
+        SelectObject(outDC, oldOut);
+        DeleteObject(pwBmp);
+        DeleteObject(outBmp);
+        DeleteDC(pwDC);
+        DeleteDC(outDC);
         ReleaseDC(nullptr, screenDC);
         return ok;
     };
@@ -859,10 +925,24 @@ int main(int argc, char* argv[]) {
                         continue;
                     }
                 }
+                // latestFrameTexture may already exist at the WGC capture
+                // item's raw (often odd) size from the frame callback, while
+                // printWindowBuffer is exactly width x height (the even-rounded
+                // size). Constrain the write to that top-left box so the source
+                // row pitch matches the buffer regardless of the texture's real
+                // width — passing nullptr here reads past printWindowBuffer when
+                // the texture is wider, corrupting the heap.
+                D3D11_BOX destBox{};
+                destBox.left = 0;
+                destBox.top = 0;
+                destBox.front = 0;
+                destBox.right = static_cast<UINT>(width);
+                destBox.bottom = static_cast<UINT>(height);
+                destBox.back = 1;
                 session.context()->UpdateSubresource(
                     latestFrameTexture.Get(),
                     0,
-                    nullptr,
+                    &destBox,
                     printWindowBuffer.data(),
                     static_cast<UINT>(width) * 4,
                     0);
