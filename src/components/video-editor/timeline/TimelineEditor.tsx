@@ -5,6 +5,7 @@ import {
 	ChevronDown,
 	Gauge,
 	MessageSquare,
+	Move,
 	Plus,
 	Scissors,
 	WandSparkles,
@@ -29,6 +30,7 @@ import { formatShortcut } from "@/utils/platformUtils";
 import type {
 	AnnotationRegion,
 	CursorTelemetryPoint,
+	MoveRegion,
 	SpeedRegion,
 	TrimRegion,
 	ZoomFocus,
@@ -45,6 +47,7 @@ const TRIM_ROW_ID = "row-trim";
 const ANNOTATION_ROW_ID = "row-annotation";
 const BLUR_ROW_ID = "row-blur";
 const SPEED_ROW_ID = "row-speed";
+const MOVE_ROW_ID_PREFIX = "row-move-";
 const FALLBACK_RANGE_MS = 1000;
 const TARGET_MARKER_COUNT = 12;
 const SUGGESTION_SPACING_MS = 1800;
@@ -86,6 +89,13 @@ interface TimelineEditorProps {
 	onSpeedDelete?: (id: string) => void;
 	selectedSpeedId?: string | null;
 	onSelectSpeed?: (id: string | null) => void;
+	layers?: Array<{ id: string; label: string }>;
+	moveRegions?: MoveRegion[];
+	onMoveAdded?: (layerId: string, span: Span) => void;
+	onMoveSpanChange?: (id: string, span: Span) => void;
+	onMoveDelete?: (id: string) => void;
+	selectedMoveId?: string | null;
+	onSelectMove?: (id: string | null) => void;
 	aspectRatio: AspectRatio;
 	onAspectRatioChange: (aspectRatio: AspectRatio) => void;
 }
@@ -105,7 +115,7 @@ interface TimelineRenderItem {
 	zoomCustomScale?: number;
 	speedValue?: number;
 	isAutoFocus?: boolean;
-	variant: "zoom" | "trim" | "annotation" | "speed" | "blur";
+	variant: "zoom" | "trim" | "annotation" | "speed" | "blur" | "move";
 }
 
 const SCALE_CANDIDATES = [
@@ -561,12 +571,15 @@ function Timeline({
 	onSelectAnnotation,
 	onSelectBlur,
 	onSelectSpeed,
+	onSelectMove,
 	selectedZoomId,
 	selectedTrimId,
 	selectedAnnotationId,
 	selectedBlurId,
 	selectedSpeedId,
+	selectedMoveId,
 	keyframes = [],
+	layers = [],
 }: {
 	items: TimelineRenderItem[];
 	videoDurationMs: number;
@@ -578,12 +591,15 @@ function Timeline({
 	onSelectAnnotation?: (id: string | null) => void;
 	onSelectBlur?: (id: string | null) => void;
 	onSelectSpeed?: (id: string | null) => void;
+	onSelectMove?: (id: string | null) => void;
 	selectedZoomId: string | null;
 	selectedTrimId?: string | null;
 	selectedAnnotationId?: string | null;
 	selectedBlurId?: string | null;
 	selectedSpeedId?: string | null;
+	selectedMoveId?: string | null;
 	keyframes?: { id: string; time: number }[];
+	layers?: Array<{ id: string; label: string }>;
 }) {
 	const t = useScopedT("timeline");
 	const { setTimelineRef, style, sidebarWidth, range, pixelsToValue } = useTimelineContext();
@@ -623,7 +639,8 @@ function Timeline({
 		onSelectAnnotation?.(null);
 		onSelectBlur?.(null);
 		onSelectSpeed?.(null);
-	}, [onSelectZoom, onSelectTrim, onSelectAnnotation, onSelectBlur, onSelectSpeed]);
+		onSelectMove?.(null);
+	}, [onSelectZoom, onSelectTrim, onSelectAnnotation, onSelectBlur, onSelectSpeed, onSelectMove]);
 
 	const handleTimelineClick = useCallback(
 		(e: React.MouseEvent<HTMLDivElement>) => {
@@ -743,6 +760,16 @@ function Timeline({
 	const annotationItems = items.filter((item) => item.rowId === ANNOTATION_ROW_ID);
 	const blurItems = items.filter((item) => item.rowId === BLUR_ROW_ID);
 	const speedItems = items.filter((item) => item.rowId === SPEED_ROW_ID);
+	const moveItemsByLayer = new Map<string, TimelineRenderItem[]>();
+	for (const layer of layers) {
+		moveItemsByLayer.set(layer.id, []);
+	}
+	for (const item of items) {
+		if (!item.rowId.startsWith(MOVE_ROW_ID_PREFIX)) continue;
+		const layerId = item.rowId.slice(MOVE_ROW_ID_PREFIX.length);
+		const bucket = moveItemsByLayer.get(layerId);
+		if (bucket) bucket.push(item);
+	}
 
 	return (
 		<div
@@ -856,6 +883,33 @@ function Timeline({
 					</Item>
 				))}
 			</Row>
+
+			{layers.map((layer) => {
+				const rowId = `${MOVE_ROW_ID_PREFIX}${layer.id}`;
+				const rowItems = moveItemsByLayer.get(layer.id) ?? [];
+				return (
+					<Row
+						key={rowId}
+						id={rowId}
+						isEmpty={rowItems.length === 0}
+						hint={`${layer.label} — add a move`}
+					>
+						{rowItems.map((item) => (
+							<Item
+								id={item.id}
+								key={item.id}
+								rowId={item.rowId}
+								span={item.span}
+								isSelected={item.id === selectedMoveId}
+								onSelect={() => onSelectMove?.(item.id)}
+								variant="move"
+							>
+								{item.label}
+							</Item>
+						))}
+					</Row>
+				);
+			})}
 		</div>
 	);
 }
@@ -897,6 +951,13 @@ export default function TimelineEditor({
 	onSpeedDelete,
 	selectedSpeedId,
 	onSelectSpeed,
+	layers = [],
+	moveRegions = [],
+	onMoveAdded,
+	onMoveSpanChange,
+	onMoveDelete,
+	selectedMoveId,
+	onSelectMove,
 	aspectRatio,
 	onAspectRatioChange,
 }: TimelineEditorProps) {
@@ -987,6 +1048,12 @@ export default function TimelineEditor({
 		onSelectSpeed(null);
 	}, [selectedSpeedId, onSpeedDelete, onSelectSpeed]);
 
+	const deleteSelectedMove = useCallback(() => {
+		if (!selectedMoveId || !onMoveDelete || !onSelectMove) return;
+		onMoveDelete(selectedMoveId);
+		onSelectMove(null);
+	}, [selectedMoveId, onMoveDelete, onSelectMove]);
+
 	useEffect(() => {
 		setRange(createInitialRange(totalMs));
 	}, [totalMs]);
@@ -1052,6 +1119,7 @@ export default function TimelineEditor({
 			const isAnnotationItem = annotationRegions.some((r) => r.id === excludeId);
 			const isBlurItem = blurRegions.some((r) => r.id === excludeId);
 			const isSpeedItem = speedRegions.some((r) => r.id === excludeId);
+			const movingMove = moveRegions.find((r) => r.id === excludeId);
 
 			if (isAnnotationItem || isBlurItem) {
 				return false;
@@ -1078,9 +1146,20 @@ export default function TimelineEditor({
 				return checkOverlap(speedRegions);
 			}
 
+			if (movingMove) {
+				// Moves only conflict with other moves on the same layer.
+				return moveRegions.some(
+					(r) =>
+						r.id !== excludeId &&
+						r.layerId === movingMove.layerId &&
+						newSpan.end > r.startMs &&
+						newSpan.start < r.endMs,
+				);
+			}
+
 			return false;
 		},
-		[zoomRegions, trimRegions, annotationRegions, blurRegions, speedRegions],
+		[zoomRegions, trimRegions, annotationRegions, blurRegions, speedRegions, moveRegions],
 	);
 
 	// At least 5% of the timeline or 1000ms, whichever is larger, so the region
@@ -1308,6 +1387,47 @@ export default function TimelineEditor({
 		onAnnotationAdded({ start: startPos, end: endPos });
 	}, [videoDuration, totalMs, currentTimeMs, onAnnotationAdded, defaultRegionDurationMs]);
 
+	// Adds a Move op at the playhead for the given layer. Skips if the
+	// playhead is already inside another Move op on that layer (overlap is
+	// disallowed per-layer; different layers may have overlapping moves).
+	const handleAddMoveForLayer = useCallback(
+		(layerId: string) => {
+			if (!videoDuration || videoDuration === 0 || totalMs === 0 || !onMoveAdded) {
+				return;
+			}
+			const defaultDuration = Math.min(defaultRegionDurationMs, totalMs);
+			if (defaultDuration <= 0) return;
+			const startPos = Math.max(0, Math.min(currentTimeMs, totalMs));
+			const layerMoves = moveRegions
+				.filter((r) => r.layerId === layerId)
+				.sort((a, b) => a.startMs - b.startMs);
+			const overlapping = layerMoves.some((r) => startPos >= r.startMs && startPos < r.endMs);
+			if (overlapping) {
+				toast.error("Cannot place move", {
+					description: "Another move already exists at this position for this layer.",
+				});
+				return;
+			}
+			const nextRegion = layerMoves.find((r) => r.startMs > startPos);
+			const gapToNext = nextRegion ? nextRegion.startMs - startPos : totalMs - startPos;
+			if (gapToNext <= 0) return;
+			const actualDuration = Math.min(defaultRegionDurationMs, gapToNext);
+			onMoveAdded(layerId, { start: startPos, end: startPos + actualDuration });
+		},
+		[videoDuration, totalMs, currentTimeMs, moveRegions, onMoveAdded, defaultRegionDurationMs],
+	);
+
+	const handleAddMove = useCallback(() => {
+		if (layers.length === 0) {
+			toast.info("No layers available");
+			return;
+		}
+		// Default: target the primary (first) layer. Per-layer rows let the
+		// user pick by clicking elsewhere; this toolbar shortcut just adds to
+		// the most prominent layer for one-key flow.
+		handleAddMoveForLayer(layers[0].id);
+	}, [layers, handleAddMoveForLayer]);
+
 	const handleAddBlur = useCallback(() => {
 		if (!videoDuration || videoDuration === 0 || totalMs === 0 || !onBlurAdded) {
 			return;
@@ -1388,6 +1508,8 @@ export default function TimelineEditor({
 					deleteSelectedBlur();
 				} else if (selectedSpeedId) {
 					deleteSelectedSpeed();
+				} else if (selectedMoveId) {
+					deleteSelectedMove();
 				}
 			}
 		};
@@ -1406,12 +1528,14 @@ export default function TimelineEditor({
 		deleteSelectedAnnotation,
 		deleteSelectedBlur,
 		deleteSelectedSpeed,
+		deleteSelectedMove,
 		selectedKeyframeId,
 		selectedZoomId,
 		selectedTrimId,
 		selectedAnnotationId,
 		selectedBlurId,
 		selectedSpeedId,
+		selectedMoveId,
 		annotationRegions,
 		currentTime,
 		onSelectAnnotation,
@@ -1489,8 +1613,16 @@ export default function TimelineEditor({
 			variant: "speed",
 		}));
 
-		return [...zooms, ...trims, ...annotations, ...blurs, ...speeds];
-	}, [zoomRegions, trimRegions, annotationRegions, blurRegions, speedRegions, t]);
+		const moves: TimelineRenderItem[] = moveRegions.map((region, index) => ({
+			id: region.id,
+			rowId: `${MOVE_ROW_ID_PREFIX}${region.layerId}`,
+			span: { start: region.startMs, end: region.endMs },
+			label: `Move ${index + 1}`,
+			variant: "move",
+		}));
+
+		return [...zooms, ...trims, ...annotations, ...blurs, ...speeds, ...moves];
+	}, [zoomRegions, trimRegions, annotationRegions, blurRegions, speedRegions, moveRegions, t]);
 
 	// Flat list of all non-annotation region spans for neighbour-clamping during drag/resize
 	const allRegionSpans = useMemo(() => {
@@ -1502,13 +1634,15 @@ export default function TimelineEditor({
 
 	const handleItemSpanChange = useCallback(
 		(id: string, span: Span) => {
-			// Check if it's a zoom, trim, speed, or annotation item
+			// Check if it's a zoom, trim, speed, move, or annotation item
 			if (zoomRegions.some((r) => r.id === id)) {
 				onZoomSpanChange(id, span);
 			} else if (trimRegions.some((r) => r.id === id)) {
 				onTrimSpanChange?.(id, span);
 			} else if (speedRegions.some((r) => r.id === id)) {
 				onSpeedSpanChange?.(id, span);
+			} else if (moveRegions.some((r) => r.id === id)) {
+				onMoveSpanChange?.(id, span);
 			} else if (annotationRegions.some((r) => r.id === id)) {
 				onAnnotationSpanChange?.(id, span);
 			} else if (blurRegions.some((r) => r.id === id)) {
@@ -1519,11 +1653,13 @@ export default function TimelineEditor({
 			zoomRegions,
 			trimRegions,
 			speedRegions,
+			moveRegions,
 			annotationRegions,
 			blurRegions,
 			onZoomSpanChange,
 			onTrimSpanChange,
 			onSpeedSpanChange,
+			onMoveSpanChange,
 			onAnnotationSpanChange,
 			onBlurSpanChange,
 		],
@@ -1617,6 +1753,16 @@ export default function TimelineEditor({
 					>
 						<Gauge className="w-4 h-4" />
 					</Button>
+					<Button
+						onClick={handleAddMove}
+						variant="ghost"
+						size="icon"
+						className="h-7 w-7 rounded-lg text-slate-400 hover:text-[#a78bfa] hover:bg-[#a78bfa]/10 transition-all disabled:opacity-30"
+						title="Add layer move"
+						disabled={layers.length === 0}
+					>
+						<Move className="w-4 h-4" />
+					</Button>
 				</div>
 				<div className="flex items-center gap-1.5 min-w-0">
 					<DropdownMenu>
@@ -1694,12 +1840,15 @@ export default function TimelineEditor({
 						onSelectAnnotation={onSelectAnnotation}
 						onSelectBlur={onSelectBlur}
 						onSelectSpeed={onSelectSpeed}
+						onSelectMove={onSelectMove}
 						selectedZoomId={selectedZoomId}
 						selectedTrimId={selectedTrimId}
 						selectedAnnotationId={selectedAnnotationId}
 						selectedBlurId={selectedBlurId}
 						selectedSpeedId={selectedSpeedId}
+						selectedMoveId={selectedMoveId}
 						keyframes={keyframes}
+						layers={layers}
 					/>
 				</TimelineWrapper>
 			</div>

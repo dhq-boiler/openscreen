@@ -32,6 +32,7 @@ import {
 	MIN_BLUR_BLOCK_SIZE,
 	MIN_BLUR_INTENSITY,
 	MIN_PLAYBACK_SPEED,
+	type MoveRegion,
 	type SpeedRegion,
 	type TrimRegion,
 	type WebcamLayoutPreset,
@@ -87,6 +88,7 @@ export interface ProjectEditorState {
 	zoomRegions: ZoomRegion[];
 	trimRegions: TrimRegion[];
 	speedRegions: SpeedRegion[];
+	moveRegions: MoveRegion[];
 	annotationRegions: AnnotationRegion[];
 	aspectRatio: AspectRatio;
 	webcamLayoutPreset: WebcamLayoutPreset;
@@ -348,6 +350,44 @@ export function normalizeProjectEditor(editor: Partial<ProjectEditorState>): Pro
 				})
 		: [];
 
+	const normalizedMoveRegions: MoveRegion[] = Array.isArray(editor.moveRegions)
+		? editor.moveRegions
+				.filter((region): region is MoveRegion =>
+					Boolean(
+						region &&
+							typeof region.id === "string" &&
+							typeof (region as { layerId?: unknown }).layerId === "string",
+					),
+				)
+				.map((region) => {
+					const rawStart = isFiniteNumber(region.startMs) ? Math.round(region.startMs) : 0;
+					const rawEnd = isFiniteNumber(region.endMs) ? Math.round(region.endMs) : rawStart + 1000;
+					const startMs = Math.max(0, Math.min(rawStart, rawEnd));
+					const endMs = Math.max(startMs + 1, rawEnd);
+					// width/height fall back to 1.0 (full-stage tile) when the
+					// saved region is from an older shape that only carried
+					// position. Users can re-edit the rect to adjust scale.
+					return {
+						id: region.id,
+						layerId: region.layerId,
+						startMs,
+						endMs,
+						from: {
+							cx: isFiniteNumber(region.from?.cx) ? region.from.cx : 0.5,
+							cy: isFiniteNumber(region.from?.cy) ? region.from.cy : 0.5,
+							width: Math.max(0.05, isFiniteNumber(region.from?.width) ? region.from.width : 1),
+							height: Math.max(0.05, isFiniteNumber(region.from?.height) ? region.from.height : 1),
+						},
+						to: {
+							cx: isFiniteNumber(region.to?.cx) ? region.to.cx : 0.5,
+							cy: isFiniteNumber(region.to?.cy) ? region.to.cy : 0.5,
+							width: Math.max(0.05, isFiniteNumber(region.to?.width) ? region.to.width : 1),
+							height: Math.max(0.05, isFiniteNumber(region.to?.height) ? region.to.height : 1),
+						},
+					};
+				})
+		: [];
+
 	const normalizedAnnotationRegions: AnnotationRegion[] = Array.isArray(editor.annotationRegions)
 		? editor.annotationRegions
 				.filter((region): region is AnnotationRegion =>
@@ -514,6 +554,7 @@ export function normalizeProjectEditor(editor: Partial<ProjectEditorState>): Pro
 		zoomRegions: normalizedZoomRegions,
 		trimRegions: normalizedTrimRegions,
 		speedRegions: normalizedSpeedRegions,
+		moveRegions: normalizedMoveRegions,
 		annotationRegions: normalizedAnnotationRegions,
 		aspectRatio: normalizedAspectRatio,
 		webcamLayoutPreset: normalizedWebcamLayoutPreset,

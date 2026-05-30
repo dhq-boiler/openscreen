@@ -1,6 +1,6 @@
 import type { Span } from "dnd-timeline";
 import { useItem, useTimelineContext } from "dnd-timeline";
-import { Gauge, MessageSquare, MousePointer2, Scissors, ZoomIn } from "lucide-react";
+import { Gauge, MessageSquare, MousePointer2, Move, Scissors, ZoomIn } from "lucide-react";
 import { useMemo } from "react";
 import { useScopedT } from "@/contexts/I18nContext";
 import { cn } from "@/lib/utils";
@@ -18,7 +18,7 @@ interface ItemProps {
 	zoomCustomScale?: number;
 	speedValue?: number;
 	isAutoFocus?: boolean;
-	variant?: "zoom" | "trim" | "annotation" | "speed" | "blur";
+	variant?: "zoom" | "trim" | "annotation" | "speed" | "blur" | "move";
 }
 
 // Map zoom depth to multiplier labels
@@ -65,6 +65,7 @@ export default function Item({
 	const isZoom = variant === "zoom";
 	const isTrim = variant === "trim";
 	const isSpeed = variant === "speed";
+	const isMove = variant === "move";
 
 	// Yellow "transitioning" strips bracket the green zoom item, marking
 	// the time windows during which the zoom is ramping in / out. Widths
@@ -80,9 +81,19 @@ export default function Item({
 			? glassStyles.glassRed
 			: isSpeed
 				? glassStyles.glassAmber
-				: glassStyles.glassYellow;
+				: isMove
+					? glassStyles.glassViolet
+					: glassStyles.glassYellow;
 
-	const endCapColor = isZoom ? "#21916A" : isTrim ? "#ef4444" : isSpeed ? "#d97706" : "#B4A046";
+	const endCapColor = isZoom
+		? "#21916A"
+		: isTrim
+			? "#ef4444"
+			: isSpeed
+				? "#d97706"
+				: isMove
+					? "#a78bfa"
+					: "#B4A046";
 
 	const timeLabel = useMemo(
 		() => `${formatMs(span.start)} – ${formatMs(span.end)}`,
@@ -184,6 +195,11 @@ export default function Item({
 									<span className="text-[11px] font-semibold whitespace-nowrap">
 										{speedValue !== undefined ? `${speedValue}×` : t("labels.speed")}
 									</span>
+								</>
+							) : isMove ? (
+								<>
+									<Move className="w-3.5 h-3.5 shrink-0" />
+									<span className="text-[11px] font-semibold whitespace-nowrap">{children}</span>
 								</>
 							) : (
 								<>

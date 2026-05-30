@@ -29,6 +29,8 @@
  */
 
 import type { LayerTransform } from "@/components/video-editor/projectPersistence";
+import type { MoveRegion } from "@/components/video-editor/types";
+import { resolveLayerRectAtTime } from "@/components/video-editor/types";
 import type { ProjectMediaV3 } from "../recordingSession";
 import { classifyWallpaper, resolveImageWallpaperUrl } from "../wallpaper";
 
@@ -57,6 +59,12 @@ export interface MultiLayerExportOptions {
 	 * instead of the legacy auto-grid layout.
 	 */
 	layerTransforms?: LayerTransform[];
+	/**
+	 * Time-bounded per-layer move animations. During [startMs, endMs] the
+	 * layer's position interpolates from `from` → `to`. Applied on top of
+	 * the static LayerTransform.position when rendering each frame.
+	 */
+	moveRegions?: MoveRegion[];
 	/**
 	 * Wallpaper from editor state (color string, CSS gradient, or image
 	 * path). Drawn under all layers; mirrors the editor preview's
@@ -296,7 +304,7 @@ function pickMimeType(): { mime: string; container: "webm" | "mp4" } {
 export async function exportMultiLayer(
 	options: MultiLayerExportOptions,
 ): Promise<MultiLayerExportResult> {
-	const { media, settings, layerTransforms, wallpaper, onProgress, signal } = options;
+	const { media, settings, layerTransforms, moveRegions, wallpaper, onProgress, signal } = options;
 	if (media.layers.length === 0) {
 		return { success: false, error: "Cannot export an empty layer list." };
 	}
@@ -407,13 +415,14 @@ export async function exportMultiLayer(
 				drawWallpaperImage(ctx, canvas.width, canvas.height, resolvedBackground.image);
 			}
 			if (useTransforms) {
+				const currentTimeMs = Math.round(primaryVideo.currentTime * 1000);
 				const transformedLayers: TransformedLayer[] = [];
 				for (let i = 0; i < prepared.length; i++) {
 					const layerId = media.layers[i].id;
 					const t = transformByLayerId.get(layerId);
 					// Fall back to a centered full-stage tile when a layer
 					// has no transform — better than silently dropping it.
-					const transform: LayerTransform = t ?? {
+					const base: LayerTransform = t ?? {
 						layerId,
 						position: { cx: 0.5, cy: 0.5 },
 						size: { width: 1, height: 1 },
@@ -421,7 +430,22 @@ export async function exportMultiLayer(
 						zOrder: i,
 						visible: true,
 					};
-					transformedLayers.push({ video: prepared[i].video, transform });
+					// Apply MoveRegion interpolation (position + size) if any
+					// active region matches this layer at the current playback
+					// time.
+					const resolved = moveRegions
+						? resolveLayerRectAtTime(
+								layerId,
+								currentTimeMs,
+								{ position: base.position, size: base.size },
+								moveRegions,
+							)
+						: { position: base.position, size: base.size };
+					const effective: LayerTransform =
+						resolved.position === base.position && resolved.size === base.size
+							? base
+							: { ...base, position: resolved.position, size: resolved.size };
+					transformedLayers.push({ video: prepared[i].video, transform: effective });
 				}
 				drawTransformedLayers(ctx, canvas.width, canvas.height, transformedLayers);
 				return;

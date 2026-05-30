@@ -91,6 +91,7 @@ import {
 	DEFAULT_PLAYBACK_SPEED,
 	DEFAULT_ZOOM_DEPTH,
 	type FigureData,
+	type MoveRegion,
 	type PlaybackSpeed,
 	type Rotation3DPreset,
 	type SpeedRegion,
@@ -174,6 +175,7 @@ export default function VideoEditor() {
 		zoomRegions,
 		trimRegions,
 		speedRegions,
+		moveRegions,
 		annotationRegions,
 		cropRegion,
 		wallpaper,
@@ -228,6 +230,7 @@ export default function VideoEditor() {
 	const [isPreviewingZoom, setIsPreviewingZoom] = useState(false);
 	const [selectedTrimId, setSelectedTrimId] = useState<string | null>(null);
 	const [selectedSpeedId, setSelectedSpeedId] = useState<string | null>(null);
+	const [selectedMoveId, setSelectedMoveId] = useState<string | null>(null);
 	const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
 	const [selectedBlurId, setSelectedBlurId] = useState<string | null>(null);
 	const [isExporting, setIsExporting] = useState(false);
@@ -291,6 +294,7 @@ export default function VideoEditor() {
 	const nextZoomIdRef = useRef(1);
 	const nextTrimIdRef = useRef(1);
 	const nextSpeedIdRef = useRef(1);
+	const nextMoveIdRef = useRef(1);
 
 	const { shortcuts, isMac } = useShortcuts();
 	// Native Windows recordings include captured cursor assets. Native macOS
@@ -310,6 +314,26 @@ export default function VideoEditor() {
 	const nextAnnotationIdRef = useRef(1);
 	const nextAnnotationZIndexRef = useRef(1);
 	const exporterRef = useRef<VideoExporter | null>(null);
+
+	// Comprehensive layer roster for the timeline. availableLayers stays empty
+	// for single-source projects (the multi-layer SettingsPanel is hidden in
+	// that case); the timeline still wants one row per layer, so we synthesize
+	// a single-layer entry from layerTransforms as a fallback.
+	const timelineLayers = useMemo(() => {
+		if (availableLayers.length > 0) {
+			return availableLayers.map((layer, idx) => ({
+				id: layer.id,
+				label: idx === 0 ? "Layer 1" : `Layer ${idx + 1}`,
+			}));
+		}
+		if (layerTransforms.length > 0) {
+			return layerTransforms.map((tr, idx) => ({
+				id: tr.layerId,
+				label: idx === 0 ? "Layer 1" : `Layer ${idx + 1}`,
+			}));
+		}
+		return [];
+	}, [availableLayers, layerTransforms]);
 
 	const annotationOnlyRegions = useMemo(
 		() => annotationRegions.filter((region) => region.type !== "blur"),
@@ -490,6 +514,7 @@ export default function VideoEditor() {
 				zoomRegions: normalizedEditor.zoomRegions,
 				trimRegions: normalizedEditor.trimRegions,
 				speedRegions: normalizedEditor.speedRegions,
+				moveRegions: normalizedEditor.moveRegions,
 				annotationRegions: normalizedEditor.annotationRegions,
 				aspectRatio: normalizedEditor.aspectRatio,
 				webcamLayoutPreset: normalizedEditor.webcamLayoutPreset,
@@ -507,6 +532,7 @@ export default function VideoEditor() {
 			setSelectedZoomId(null);
 			setSelectedTrimId(null);
 			setSelectedSpeedId(null);
+			setSelectedMoveId(null);
 			setSelectedAnnotationId(null);
 			setSelectedBlurId(null);
 
@@ -562,6 +588,7 @@ export default function VideoEditor() {
 			zoomRegions,
 			trimRegions,
 			speedRegions,
+			moveRegions,
 			annotationRegions,
 			aspectRatio,
 			webcamLayoutPreset,
@@ -586,6 +613,7 @@ export default function VideoEditor() {
 		zoomRegions,
 		trimRegions,
 		speedRegions,
+		moveRegions,
 		annotationRegions,
 		aspectRatio,
 		webcamLayoutPreset,
@@ -728,6 +756,7 @@ export default function VideoEditor() {
 				zoomRegions,
 				trimRegions,
 				speedRegions,
+				moveRegions,
 				annotationRegions,
 				aspectRatio,
 				webcamLayoutPreset,
@@ -795,6 +824,7 @@ export default function VideoEditor() {
 			zoomRegions,
 			trimRegions,
 			speedRegions,
+			moveRegions,
 			annotationRegions,
 			aspectRatio,
 			webcamLayoutPreset,
@@ -967,6 +997,7 @@ export default function VideoEditor() {
 		if (id) {
 			setSelectedTrimId(null);
 			setSelectedSpeedId(null);
+			setSelectedMoveId(null);
 			setSelectedAnnotationId(null);
 			setSelectedBlurId(null);
 		}
@@ -977,6 +1008,7 @@ export default function VideoEditor() {
 		if (id) {
 			setSelectedZoomId(null);
 			setSelectedSpeedId(null);
+			setSelectedMoveId(null);
 			setSelectedAnnotationId(null);
 			setSelectedBlurId(null);
 		}
@@ -988,6 +1020,7 @@ export default function VideoEditor() {
 			setSelectedZoomId(null);
 			setSelectedTrimId(null);
 			setSelectedSpeedId(null);
+			setSelectedMoveId(null);
 			setSelectedBlurId(null);
 		}
 	}, []);
@@ -999,6 +1032,7 @@ export default function VideoEditor() {
 			setSelectedTrimId(null);
 			setSelectedAnnotationId(null);
 			setSelectedSpeedId(null);
+			setSelectedMoveId(null);
 		}
 	}, []);
 
@@ -1017,6 +1051,7 @@ export default function VideoEditor() {
 			setSelectedZoomId(id);
 			setSelectedTrimId(null);
 			setSelectedSpeedId(null);
+			setSelectedMoveId(null);
 			setSelectedAnnotationId(null);
 			setSelectedBlurId(null);
 		},
@@ -1054,6 +1089,7 @@ export default function VideoEditor() {
 			setSelectedTrimId(id);
 			setSelectedZoomId(null);
 			setSelectedSpeedId(null);
+			setSelectedMoveId(null);
 			setSelectedAnnotationId(null);
 			setSelectedBlurId(null);
 		},
@@ -1266,6 +1302,7 @@ export default function VideoEditor() {
 			setSelectedTrimId(null);
 			setSelectedAnnotationId(null);
 			setSelectedBlurId(null);
+			setSelectedMoveId(null);
 		}
 	}, []);
 
@@ -1329,6 +1366,110 @@ export default function VideoEditor() {
 			}));
 		},
 		[selectedSpeedId, pushState],
+	);
+
+	const handleSelectMove = useCallback((id: string | null) => {
+		setSelectedMoveId(id);
+		if (id) {
+			setSelectedZoomId(null);
+			setSelectedTrimId(null);
+			setSelectedSpeedId(null);
+			setSelectedAnnotationId(null);
+			setSelectedBlurId(null);
+		}
+	}, []);
+
+	const handleMoveAdded = useCallback(
+		(layerId: string, span: Span) => {
+			const id = `move-${nextMoveIdRef.current++}`;
+			// Snapshot the layer's static rect (position + size) as `from`;
+			// nudge `to` so the user can immediately see the move has effect.
+			// `to` shifts +0.15 horizontally and scales 1.2× so motion AND
+			// scale are visible by default — both can be edited later by
+			// dragging / resizing on the stage at the appropriate playhead.
+			const baseTransform = layerTransforms.find((tr) => tr.layerId === layerId);
+			const baseCx = baseTransform?.position.cx ?? 0.5;
+			const baseCy = baseTransform?.position.cy ?? 0.5;
+			const baseW = baseTransform?.size.width ?? 1;
+			const baseH = baseTransform?.size.height ?? 1;
+			const from = { cx: baseCx, cy: baseCy, width: baseW, height: baseH };
+			const to = {
+				cx: Math.max(0, Math.min(1, baseCx + 0.15)),
+				cy: baseCy,
+				width: Math.max(0.05, baseW * 1.2),
+				height: Math.max(0.05, baseH * 1.2),
+			};
+			const newRegion: MoveRegion = {
+				id,
+				layerId,
+				startMs: Math.round(span.start),
+				endMs: Math.round(span.end),
+				from,
+				to,
+			};
+			pushState((prev) => ({ moveRegions: [...prev.moveRegions, newRegion] }));
+			setSelectedMoveId(id);
+			setSelectedZoomId(null);
+			setSelectedTrimId(null);
+			setSelectedSpeedId(null);
+			setSelectedAnnotationId(null);
+			setSelectedBlurId(null);
+		},
+		[layerTransforms, pushState],
+	);
+
+	const handleMoveSpanChange = useCallback(
+		(id: string, span: Span) => {
+			pushState((prev) => ({
+				moveRegions: prev.moveRegions.map((region) =>
+					region.id === id
+						? {
+								...region,
+								startMs: Math.round(span.start),
+								endMs: Math.round(span.end),
+							}
+						: region,
+				),
+			}));
+		},
+		[pushState],
+	);
+
+	const handleMoveFromChange = useCallback(
+		(id: string, next: { cx: number; cy: number; width: number; height: number }) => {
+			// updateState (streaming) so live drag on the stage / panel input
+			// edits coalesce into a single undo checkpoint per gesture.
+			// Callers pair this with commitState on drag-end / blur.
+			updateState((prev) => ({
+				moveRegions: prev.moveRegions.map((region) =>
+					region.id === id ? { ...region, from: next } : region,
+				),
+			}));
+		},
+		[updateState],
+	);
+
+	const handleMoveToChange = useCallback(
+		(id: string, next: { cx: number; cy: number; width: number; height: number }) => {
+			updateState((prev) => ({
+				moveRegions: prev.moveRegions.map((region) =>
+					region.id === id ? { ...region, to: next } : region,
+				),
+			}));
+		},
+		[updateState],
+	);
+
+	const handleMoveDelete = useCallback(
+		(id: string) => {
+			pushState((prev) => ({
+				moveRegions: prev.moveRegions.filter((region) => region.id !== id),
+			}));
+			if (selectedMoveId === id) {
+				setSelectedMoveId(null);
+			}
+		},
+		[selectedMoveId, pushState],
 	);
 
 	const handleAnnotationAdded = useCallback(
@@ -1963,6 +2104,7 @@ export default function VideoEditor() {
 						const multiResult = await multi.exportMultiLayer({
 							media: multiMedia,
 							layerTransforms,
+							moveRegions,
 							wallpaper,
 							settings: {
 								width: exportWidth,
@@ -2123,6 +2265,7 @@ export default function VideoEditor() {
 			zoomRegions,
 			trimRegions,
 			speedRegions,
+			moveRegions,
 			layerTransforms,
 			additionalLayerIds,
 			additionalLayerPaths,
@@ -2393,6 +2536,11 @@ export default function VideoEditor() {
 												layerTransforms={layerTransforms}
 												onLayerTransformUpdate={handleLayerTransformUpdate}
 												onLayerTransformCommit={commitState}
+												moveRegions={moveRegions}
+												selectedMoveId={selectedMoveId}
+												onMoveFromChange={handleMoveFromChange}
+												onMoveToChange={handleMoveToChange}
+												onMoveCommit={commitState}
 												webcamVideoPath={webcamVideoPath || undefined}
 												webcamLayoutPreset={webcamLayoutPreset}
 												webcamMaskShape={webcamMaskShape}
@@ -2616,6 +2764,17 @@ export default function VideoEditor() {
 									}
 									onSpeedChange={handleSpeedChange}
 									onSpeedDelete={handleSpeedDelete}
+									selectedMoveId={selectedMoveId}
+									moveRegions={moveRegions}
+									layerTransforms={layerTransforms}
+									layerLabelsById={Object.fromEntries(
+										timelineLayers.map((layer) => [layer.id, layer.label]),
+									)}
+									onMoveFromChange={handleMoveFromChange}
+									onMoveToChange={handleMoveToChange}
+									onMoveCommit={commitState}
+									onMoveDelete={handleMoveDelete}
+									onSeek={handleSeek}
 									unsavedExport={unsavedExport}
 									onSaveUnsavedExport={handleSaveUnsavedExport}
 									onSaveDiagnostic={handleSaveDiagnostic}
@@ -2683,6 +2842,13 @@ export default function VideoEditor() {
 								onBlurDelete={handleAnnotationDelete}
 								selectedBlurId={selectedBlurId}
 								onSelectBlur={handleSelectBlur}
+								layers={timelineLayers}
+								moveRegions={moveRegions}
+								onMoveAdded={handleMoveAdded}
+								onMoveSpanChange={handleMoveSpanChange}
+								onMoveDelete={handleMoveDelete}
+								selectedMoveId={selectedMoveId}
+								onSelectMove={handleSelectMove}
 								aspectRatio={aspectRatio}
 								onAspectRatioChange={(ar) =>
 									pushState({

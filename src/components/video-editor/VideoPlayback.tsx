@@ -63,6 +63,7 @@ import {
 	DEFAULT_ROTATION_3D,
 	isRotation3DIdentity,
 	lerpRotation3D,
+	resolveLayerRectAtTime,
 	rotation3DPerspective,
 	type SpeedRegion,
 	type TrimRegion,
@@ -138,6 +139,32 @@ interface VideoPlaybackProps {
 	) => void;
 	/** Phase 4.5: pointer-up commit so undo/redo sees one checkpoint per gesture. */
 	onLayerTransformCommit?: () => void;
+	/**
+	 * Per-layer time-bounded move animations. When the playhead falls inside
+	 * a region, the layer's position interpolates from `from` to `to`. Reads
+	 * here are display-only — drag/resize callbacks still write the static
+	 * LayerTransform.position, so move regions sit on top of, not replace,
+	 * the user-placed layout.
+	 */
+	moveRegions?: import("./types").MoveRegion[];
+	/**
+	 * Currently selected Move id. When set, VideoPlayback overlays a pair of
+	 * draggable ghost rects (`from` / `to`) on the stage so the user can edit
+	 * the move trajectory visually without leaving the preview.
+	 */
+	selectedMoveId?: string | null;
+	/** Streaming update during stage drag/resize of the `from` rect. */
+	onMoveFromChange?: (
+		id: string,
+		next: { cx: number; cy: number; width: number; height: number },
+	) => void;
+	/** Streaming update during stage drag/resize of the `to` rect. */
+	onMoveToChange?: (
+		id: string,
+		next: { cx: number; cy: number; width: number; height: number },
+	) => void;
+	/** Pointer-up commit so the gesture lands as one undo checkpoint. */
+	onMoveCommit?: () => void;
 	webcamVideoPath?: string;
 	webcamLayoutPreset: WebcamLayoutPreset;
 	webcamMaskShape?: import("./types").WebcamMaskShape;
@@ -268,6 +295,11 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			layerTransforms = [],
 			onLayerTransformUpdate,
 			onLayerTransformCommit,
+			moveRegions = [],
+			selectedMoveId = null,
+			onMoveFromChange,
+			onMoveToChange,
+			onMoveCommit,
 			webcamVideoPath,
 			webcamLayoutPreset,
 			webcamMaskShape,
@@ -371,12 +403,35 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			height: number;
 		}>({ x: 0, y: 0, width: 0, height: 0 });
 		const primaryRectSyncedRef = useRef(false);
+		// Apply time-bounded MoveRegions to each layer's static rect so
+		// playback shows the animated position AND size. The base transform's
+		// rotation/zOrder/visibility are untouched; only `position` and
+		// `size` are overridden. Drag/resize callbacks still write the static
+		// LayerTransform, so the user-placed layout remains the editable
+		// source of truth.
+		const effectiveLayerTransforms = useMemo(() => {
+			if (moveRegions.length === 0) return layerTransforms;
+			const currentTimeMs = Math.round(currentTime * 1000);
+			return layerTransforms.map((tr) => {
+				const resolved = resolveLayerRectAtTime(
+					tr.layerId,
+					currentTimeMs,
+					{ position: tr.position, size: tr.size },
+					moveRegions,
+				);
+				if (resolved.position === tr.position && resolved.size === tr.size) {
+					return tr;
+				}
+				return { ...tr, position: resolved.position, size: resolved.size };
+			});
+		}, [layerTransforms, moveRegions, currentTime]);
+
 		// Phase 6.5: hoisted up so the layoutVideoContent useCallback below
 		// can list enablePrimaryTile in its deps without a TDZ error. Recomputed
 		// every render; cheap because it's just a find() + boolean.
 		const primaryTransform =
 			primaryLayerId != null
-				? (layerTransforms.find((t) => t.layerId === primaryLayerId) ?? null)
+				? (effectiveLayerTransforms.find((t) => t.layerId === primaryLayerId) ?? null)
 				: null;
 		const enablePrimaryTile = Boolean(
 			primaryTransform && additionalLayerPaths.length > 0 && primaryLayerId,
@@ -2254,11 +2309,19 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					<MultiLayerOverlay
 						paths={additionalLayerPaths}
 						layerIds={additionalLayerIds}
-						transforms={layerTransforms}
+						transforms={effectiveLayerTransforms}
 						onUpdate={onLayerTransformUpdate}
 						onCommit={onLayerTransformCommit}
 						isPlaying={isPlaying}
 						currentTime={currentTime}
+					/>
+					<MoveEditorOverlay
+						selectedMove={
+							selectedMoveId ? (moveRegions.find((r) => r.id === selectedMoveId) ?? null) : null
+						}
+						onFromChange={onMoveFromChange}
+						onToChange={onMoveToChange}
+						onCommit={onMoveCommit}
 					/>
 					{/* Phase 11 (stage-wide annotations): annotation / blur overlay
 				    spans the entire stage so blurs / annotations can be placed
@@ -2360,7 +2423,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 													videoEls.forEach((v) => {
 														const id = v.dataset.layerVideoId;
 														if (!id) return;
-														const t = layerTransforms.find((lt) => lt.layerId === id);
+														const t = effectiveLayerTransforms.find((lt) => lt.layerId === id);
 														if (!t) return;
 														if (t.visible === false) return;
 														const widthPx = Math.max(60, t.size.width * stagePxWidth);
@@ -2699,6 +2762,209 @@ function MultiLayerOverlay({
 					</Rnd>
 				);
 			})}
+		</div>
+	);
+}
+
+/**
+ * Renders two draggable / resizable ghost rects (the Move's `from` and `to`
+ * endpoints) plus a dashed arrow between their centers, so the user can
+ * adjust a MoveRegion's trajectory visually instead of typing numbers.
+ *
+ * The ghosts are decoupled from the actual layer playback — Layer 1/2/3
+ * still render at the time-interpolated `effective` position behind them.
+ * Drag/resize streams updates via onFromChange / onToChange (mapped to
+ * useEditorHistory.updateState); pointer-up fires onCommit so the gesture
+ * lands as a single undo checkpoint.
+ */
+function MoveEditorOverlay({
+	selectedMove,
+	onFromChange,
+	onToChange,
+	onCommit,
+}: {
+	selectedMove: import("./types").MoveRegion | null;
+	onFromChange?: (
+		id: string,
+		next: { cx: number; cy: number; width: number; height: number },
+	) => void;
+	onToChange?: (
+		id: string,
+		next: { cx: number; cy: number; width: number; height: number },
+	) => void;
+	onCommit?: () => void;
+}) {
+	const containerRef = useRef<HTMLDivElement | null>(null);
+	const [containerSize, setContainerSize] = useState<{ width: number; height: number }>({
+		width: 0,
+		height: 0,
+	});
+
+	useEffect(() => {
+		const el = containerRef.current;
+		if (!el) return;
+		const update = () => {
+			setContainerSize({ width: el.clientWidth, height: el.clientHeight });
+		};
+		update();
+		const observer = new ResizeObserver(update);
+		observer.observe(el);
+		return () => observer.disconnect();
+	}, []);
+
+	const stageWidth = containerSize.width;
+	const stageHeight = containerSize.height;
+	const haveStage = stageWidth > 0 && stageHeight > 0;
+
+	if (!selectedMove || !haveStage) {
+		return (
+			<div
+				ref={containerRef}
+				className="absolute inset-0"
+				style={{ pointerEvents: "none" }}
+				aria-hidden="true"
+			/>
+		);
+	}
+
+	const rectToPx = (rect: { cx: number; cy: number; width: number; height: number }) => {
+		const widthPx = Math.max(40, rect.width * stageWidth);
+		const heightPx = Math.max(28, rect.height * stageHeight);
+		return {
+			x: rect.cx * stageWidth - widthPx / 2,
+			y: rect.cy * stageHeight - heightPx / 2,
+			width: widthPx,
+			height: heightPx,
+		};
+	};
+
+	const fromRect = rectToPx(selectedMove.from);
+	const toRect = rectToPx(selectedMove.to);
+
+	const fromCenter = { x: fromRect.x + fromRect.width / 2, y: fromRect.y + fromRect.height / 2 };
+	const toCenter = { x: toRect.x + toRect.width / 2, y: toRect.y + toRect.height / 2 };
+
+	const moveId = selectedMove.id;
+
+	return (
+		<div
+			ref={containerRef}
+			className="absolute inset-0"
+			style={{ pointerEvents: "none", zIndex: 200 }}
+		>
+			<svg
+				className="absolute inset-0 h-full w-full"
+				style={{ pointerEvents: "none" }}
+				aria-hidden="true"
+			>
+				<title>Move trajectory</title>
+				<defs>
+					<marker
+						id={`move-arrow-${moveId}`}
+						viewBox="0 0 10 10"
+						refX="9"
+						refY="5"
+						markerWidth="6"
+						markerHeight="6"
+						orient="auto-start-reverse"
+					>
+						<path d="M 0 0 L 10 5 L 0 10 z" fill="#a78bfa" />
+					</marker>
+				</defs>
+				<line
+					x1={fromCenter.x}
+					y1={fromCenter.y}
+					x2={toCenter.x}
+					y2={toCenter.y}
+					stroke="#a78bfa"
+					strokeWidth={2}
+					strokeDasharray="6 4"
+					markerEnd={`url(#move-arrow-${moveId})`}
+					opacity={0.75}
+				/>
+			</svg>
+
+			<Rnd
+				size={{ width: fromRect.width, height: fromRect.height }}
+				position={{ x: fromRect.x, y: fromRect.y }}
+				minWidth={40}
+				minHeight={28}
+				disableDragging={!onFromChange}
+				enableResizing={Boolean(onFromChange)}
+				onDrag={(_e, d) => {
+					if (!onFromChange) return;
+					onFromChange(moveId, {
+						cx: (d.x + fromRect.width / 2) / stageWidth,
+						cy: (d.y + fromRect.height / 2) / stageHeight,
+						width: selectedMove.from.width,
+						height: selectedMove.from.height,
+					});
+				}}
+				onDragStop={() => onCommit?.()}
+				onResize={(_e, _dir, ref, _delta, position) => {
+					if (!onFromChange) return;
+					const w = ref.offsetWidth;
+					const h = ref.offsetHeight;
+					onFromChange(moveId, {
+						cx: (position.x + w / 2) / stageWidth,
+						cy: (position.y + h / 2) / stageHeight,
+						width: Math.max(0.05, w / stageWidth),
+						height: Math.max(0.05, h / stageHeight),
+					});
+				}}
+				onResizeStop={() => onCommit?.()}
+				style={{
+					border: "2px dashed #fbbf24",
+					background: "rgba(251, 191, 36, 0.08)",
+					pointerEvents: "auto",
+					boxShadow: "0 0 0 1px rgba(251, 191, 36, 0.25), 0 8px 24px rgba(0,0,0,0.35)",
+				}}
+			>
+				<div className="pointer-events-none absolute -top-5 left-0 rounded bg-amber-500/90 px-1.5 py-0.5 text-[10px] font-semibold text-white shadow">
+					FROM
+				</div>
+			</Rnd>
+
+			<Rnd
+				size={{ width: toRect.width, height: toRect.height }}
+				position={{ x: toRect.x, y: toRect.y }}
+				minWidth={40}
+				minHeight={28}
+				disableDragging={!onToChange}
+				enableResizing={Boolean(onToChange)}
+				onDrag={(_e, d) => {
+					if (!onToChange) return;
+					onToChange(moveId, {
+						cx: (d.x + toRect.width / 2) / stageWidth,
+						cy: (d.y + toRect.height / 2) / stageHeight,
+						width: selectedMove.to.width,
+						height: selectedMove.to.height,
+					});
+				}}
+				onDragStop={() => onCommit?.()}
+				onResize={(_e, _dir, ref, _delta, position) => {
+					if (!onToChange) return;
+					const w = ref.offsetWidth;
+					const h = ref.offsetHeight;
+					onToChange(moveId, {
+						cx: (position.x + w / 2) / stageWidth,
+						cy: (position.y + h / 2) / stageHeight,
+						width: Math.max(0.05, w / stageWidth),
+						height: Math.max(0.05, h / stageHeight),
+					});
+				}}
+				onResizeStop={() => onCommit?.()}
+				style={{
+					border: "2px dashed #a78bfa",
+					background: "rgba(167, 139, 250, 0.1)",
+					pointerEvents: "auto",
+					boxShadow: "0 0 0 1px rgba(167, 139, 250, 0.3), 0 8px 24px rgba(0,0,0,0.35)",
+				}}
+			>
+				<div className="pointer-events-none absolute -top-5 left-0 rounded bg-violet-500/90 px-1.5 py-0.5 text-[10px] font-semibold text-white shadow">
+					TO
+				</div>
+			</Rnd>
 		</div>
 	);
 }

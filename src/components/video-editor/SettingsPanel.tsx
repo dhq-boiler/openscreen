@@ -64,6 +64,7 @@ import {
 	DEFAULT_WEBCAM_SETTINGS,
 } from "./editorDefaults";
 import { KeyboardShortcutsHelp } from "./KeyboardShortcutsHelp";
+import { MoveSettingsPanel } from "./MoveSettingsPanel";
 import type {
 	AnnotationRegion,
 	AnnotationType,
@@ -319,6 +320,16 @@ interface SettingsPanelProps {
 	selectedSpeedValue?: PlaybackSpeed | null;
 	onSpeedChange?: (speed: PlaybackSpeed) => void;
 	onSpeedDelete?: (id: string) => void;
+	selectedMoveId?: string | null;
+	moveRegions?: import("./types").MoveRegion[];
+	layerTransforms?: import("./projectPersistence").LayerTransform[];
+	/** Layer label lookup for the Move panel header. Keyed by VideoLayer.id. */
+	layerLabelsById?: Record<string, string>;
+	onMoveFromChange?: (id: string, next: import("./MoveSettingsPanel").MoveRect) => void;
+	onMoveToChange?: (id: string, next: import("./MoveSettingsPanel").MoveRect) => void;
+	onMoveCommit?: () => void;
+	onMoveDelete?: (id: string) => void;
+	onSeek?: (time: number) => void;
 	hasWebcam?: boolean;
 	webcamLayoutPreset?: WebcamLayoutPreset;
 	onWebcamLayoutPresetChange?: (preset: WebcamLayoutPreset) => void;
@@ -451,6 +462,15 @@ export function SettingsPanel({
 	selectedSpeedValue,
 	onSpeedChange,
 	onSpeedDelete,
+	selectedMoveId,
+	moveRegions = [],
+	layerTransforms = [],
+	layerLabelsById = {},
+	onMoveFromChange,
+	onMoveToChange,
+	onMoveCommit,
+	onMoveDelete,
+	onSeek,
 	hasWebcam = false,
 	webcamLayoutPreset = DEFAULT_WEBCAM_SETTINGS.layoutPreset,
 	onWebcamLayoutPresetChange,
@@ -610,7 +630,18 @@ export function SettingsPanel({
 
 	const zoomEnabled = Boolean(selectedZoomDepth);
 	const trimEnabled = Boolean(selectedTrimId);
-	const hasTimelineSelection = Boolean(selectedZoomId || selectedTrimId || selectedSpeedId);
+	const hasTimelineSelection = Boolean(
+		selectedZoomId || selectedTrimId || selectedSpeedId || selectedMoveId,
+	);
+	const selectedMove = selectedMoveId
+		? (moveRegions.find((r) => r.id === selectedMoveId) ?? null)
+		: null;
+	const selectedMoveLayerLabel = selectedMove
+		? (layerLabelsById[selectedMove.layerId] ?? selectedMove.layerId)
+		: "";
+	const selectedMoveBaseTransform = selectedMove
+		? (layerTransforms.find((tr) => tr.layerId === selectedMove.layerId) ?? null)
+		: null;
 	const hasCursorPanel = showCursorSettings && hasCursorData;
 	const panelModes: Array<{
 		id: SettingsPanelMode;
@@ -641,7 +672,9 @@ export function SettingsPanel({
 			? t("zoom.level")
 			: selectedSpeedId
 				? t("speed.playbackSpeed")
-				: t("trim.deleteRegion")
+				: selectedMoveId
+					? "Move"
+					: t("trim.deleteRegion")
 		: ([...panelModes, exportPanelMode].find((mode) => mode.id === activePanelMode)?.label ??
 			t("background.title"));
 
@@ -789,6 +822,29 @@ export function SettingsPanel({
 						onBlurDataChange={(blurData) => onBlurDataChange(selectedBlur.id, blurData)}
 						onBlurDataCommit={onBlurDataCommit}
 						onDelete={() => onBlurDelete(selectedBlur.id)}
+					/>
+				</div>
+				<div className="flex-shrink-0 p-3 border-t border-white/[0.07] bg-black/25">
+					{commonFooterLinks}
+				</div>
+			</div>
+		);
+	}
+
+	if (selectedMove && onMoveFromChange && onMoveToChange && onMoveDelete) {
+		return (
+			<div className="editor-inspector-shell flex min-w-0 flex-col h-full overflow-hidden">
+				<div className="min-h-0 flex-1 overflow-hidden">
+					<MoveSettingsPanel
+						region={selectedMove}
+						layerLabel={selectedMoveLayerLabel}
+						baseTransform={selectedMoveBaseTransform}
+						onFromChange={(next) => onMoveFromChange(selectedMove.id, next)}
+						onToChange={(next) => onMoveToChange(selectedMove.id, next)}
+						onCommit={onMoveCommit}
+						onJumpToStart={() => onSeek?.(selectedMove.startMs / 1000)}
+						onJumpToEnd={() => onSeek?.(selectedMove.endMs / 1000)}
+						onDelete={() => onMoveDelete(selectedMove.id)}
 					/>
 				</div>
 				<div className="flex-shrink-0 p-3 border-t border-white/[0.07] bg-black/25">

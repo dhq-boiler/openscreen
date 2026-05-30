@@ -375,6 +375,79 @@ export interface SpeedRegion {
 	speed: PlaybackSpeed;
 }
 
+/**
+ * Time-bounded layer move + scale operation. During [startMs, endMs] the
+ * layer's rect (position + size) interpolates linearly from `from` to `to`.
+ * Coordinates are normalized stage units (same space as LayerTransform);
+ * `width` and `height` are normalized layer size like LayerTransform.size.
+ *
+ * Outside this range the static LayerTransform (or any other active
+ * MoveRegion for the same layer) governs.
+ *
+ * Each MoveRegion targets exactly one VideoLayer.id. Multiple MoveRegions
+ * may exist for the same layer but must not overlap in time — UI enforces
+ * this on add/drag/resize.
+ */
+export interface MoveRegion {
+	id: string;
+	layerId: string;
+	startMs: number;
+	endMs: number;
+	from: { cx: number; cy: number; width: number; height: number };
+	to: { cx: number; cy: number; width: number; height: number };
+}
+
+export interface LayerRect {
+	position: { cx: number; cy: number };
+	size: { width: number; height: number };
+}
+
+/**
+ * Resolves a layer's effective rect (position + size) at the given time,
+ * applying any active MoveRegion for that layer.
+ *
+ * - If t falls inside a region: interpolate from `from` → `to`.
+ * - If t falls past one or more regions: stick at the most-recent region's `to`.
+ * - Otherwise: return base rect unchanged.
+ */
+export function resolveLayerRectAtTime(
+	layerId: string,
+	timeMs: number,
+	base: LayerRect,
+	moveRegions: MoveRegion[],
+): LayerRect {
+	const relevant = moveRegions
+		.filter((r) => r.layerId === layerId)
+		.sort((a, b) => a.startMs - b.startMs);
+
+	let resolved = base;
+	for (const region of relevant) {
+		if (timeMs < region.startMs) {
+			break;
+		}
+		if (timeMs >= region.endMs) {
+			resolved = {
+				position: { cx: region.to.cx, cy: region.to.cy },
+				size: { width: region.to.width, height: region.to.height },
+			};
+			continue;
+		}
+		const span = Math.max(1, region.endMs - region.startMs);
+		const t = (timeMs - region.startMs) / span;
+		return {
+			position: {
+				cx: region.from.cx + (region.to.cx - region.from.cx) * t,
+				cy: region.from.cy + (region.to.cy - region.from.cy) * t,
+			},
+			size: {
+				width: region.from.width + (region.to.width - region.from.width) * t,
+				height: region.from.height + (region.to.height - region.from.height) * t,
+			},
+		};
+	}
+	return resolved;
+}
+
 export const SPEED_OPTIONS: Array<{ speed: PlaybackSpeed; label: string }> = [
 	{ speed: 0.25, label: "0.25×" },
 	{ speed: 0.5, label: "0.5×" },

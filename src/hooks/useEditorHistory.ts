@@ -8,6 +8,7 @@ import type { LayerTransform } from "@/components/video-editor/projectPersistenc
 import type {
 	AnnotationRegion,
 	CropRegion,
+	MoveRegion,
 	SpeedRegion,
 	TrimRegion,
 	WebcamLayoutPreset,
@@ -25,6 +26,7 @@ export interface EditorState {
 	zoomRegions: ZoomRegion[];
 	trimRegions: TrimRegion[];
 	speedRegions: SpeedRegion[];
+	moveRegions: MoveRegion[];
 	annotationRegions: AnnotationRegion[];
 	cropRegion: CropRegion;
 	wallpaper: string;
@@ -45,6 +47,7 @@ export const INITIAL_EDITOR_STATE: EditorState = {
 	zoomRegions: [],
 	trimRegions: [],
 	speedRegions: [],
+	moveRegions: [],
 	annotationRegions: [],
 	cropRegion: DEFAULT_CROP_REGION,
 	wallpaper: DEFAULT_EDITOR_LAYOUT_SETTINGS.wallpaper,
