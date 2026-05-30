@@ -566,12 +566,18 @@ function normalizeLayerTransforms(raw: unknown[]): LayerTransform[] {
 		.map((entry) => ({
 			layerId: entry.layerId,
 			position: {
-				cx: clamp(isFiniteNumber(entry.position?.cx) ? entry.position.cx : 0.5, 0, 1),
-				cy: clamp(isFiniteNumber(entry.position?.cy) ? entry.position.cy : 0.5, 0, 1),
+				// Position is intentionally not clamped to [0, 1]: layers may
+				// be placed partially or fully outside the background area in
+				// the editor. composeStageCanvas / export clips to the stage
+				// rect, so out-of-range values render correctly there.
+				cx: isFiniteNumber(entry.position?.cx) ? entry.position.cx : 0.5,
+				cy: isFiniteNumber(entry.position?.cy) ? entry.position.cy : 0.5,
 			},
 			size: {
-				width: clamp(isFiniteNumber(entry.size?.width) ? entry.size.width : 1, 0.05, 1),
-				height: clamp(isFiniteNumber(entry.size?.height) ? entry.size.height : 1, 0.05, 1),
+				// Lower-bound only: prevent degenerate zero-size layers but
+				// allow size > 1 so a layer can be larger than the stage.
+				width: Math.max(0.05, isFiniteNumber(entry.size?.width) ? entry.size.width : 1),
+				height: Math.max(0.05, isFiniteNumber(entry.size?.height) ? entry.size.height : 1),
 			},
 			rotation: isFiniteNumber(entry.rotation) ? entry.rotation : 0,
 			zOrder: isFiniteNumber(entry.zOrder) ? entry.zOrder : 0,

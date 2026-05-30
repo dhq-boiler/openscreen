@@ -1941,13 +1941,16 @@ export default function VideoEditor() {
 					// Editor effects (zoom/cursor/annotations/wallpaper) are
 					// not applied here — that integration is Phase 6.
 					if (additionalLayerPaths.length > 0 && videoSourcePath) {
+						// Use the editor's real layer IDs so layerTransforms
+						// (keyed by id) line up with the exported media.
+						const primaryId = availableLayers[0]?.id ?? `layer-primary-${Date.now()}`;
 						const primaryLayer = {
-							id: "layer-primary",
+							id: primaryId,
 							kind: "screen" as const,
 							screenVideoPath: videoSourcePath,
 						};
 						const extraLayers = additionalLayerPaths.map((p, i) => ({
-							id: `layer-${i + 1}`,
+							id: additionalLayerIds[i] ?? `layer-extra-${i}-${Date.now()}`,
 							kind: "screen" as const,
 							screenVideoPath: fromFileUrl(p),
 						}));
@@ -1959,6 +1962,8 @@ export default function VideoEditor() {
 						const multi = await import("@/lib/exporter/multiLayerExporter");
 						const multiResult = await multi.exportMultiLayer({
 							media: multiMedia,
+							layerTransforms,
+							wallpaper,
 							settings: {
 								width: exportWidth,
 								height: exportHeight,
@@ -2118,6 +2123,10 @@ export default function VideoEditor() {
 			zoomRegions,
 			trimRegions,
 			speedRegions,
+			layerTransforms,
+			additionalLayerIds,
+			additionalLayerPaths,
+			availableLayers,
 			shadowIntensity,
 			showBlur,
 			motionBlurAmount,

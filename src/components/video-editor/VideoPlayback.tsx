@@ -2005,6 +2005,14 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		return (
 			<div
 				ref={outerWrapperRef}
+				// overflow:hidden keeps the CSS zoom transform on
+				// stageContentRef from visually spilling past the
+				// aspect-ratio frame during zoom-region playback.
+				// Layer Rnds (Layer 1 / Layer 2 / Layer 3) may still be
+				// positioned with cx/cy outside [0, 1] — those positions
+				// persist and the export pipeline renders them correctly,
+				// but the portion outside the background area is clipped
+				// in the editor preview.
 				className="relative rounded-sm overflow-hidden"
 				style={{
 					width: "100%",
@@ -2037,7 +2045,8 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					<Rnd
 						size={{ width: primaryStageWidthPx, height: primaryStageHeightPx }}
 						position={{ x: primaryStageXPx, y: primaryStageYPx }}
-						bounds="parent"
+						// No `bounds` set: Layer 1 may be dragged outside the
+						// background area. The export pipeline clips to stage.
 						disableDragging={!enablePrimaryTile}
 						enableResizing={enablePrimaryTile}
 						// Phase 6.5 fix: don't capture pointerdown that originated
@@ -2059,11 +2068,10 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 							if (!enablePrimaryTile || !primaryLayerId || !onLayerTransformUpdate) return;
 							const cx = (d.x + primaryStageWidthPx / 2) / stagePxWidth;
 							const cy = (d.y + primaryStageHeightPx / 2) / stagePxHeight;
+							// cx/cy intentionally unclamped: the layer may sit
+							// outside [0, 1] when dragged past the background.
 							onLayerTransformUpdate(primaryLayerId, {
-								position: {
-									cx: Math.max(0, Math.min(1, cx)),
-									cy: Math.max(0, Math.min(1, cy)),
-								},
+								position: { cx, cy },
 							});
 						}}
 						onDragStop={() => {
@@ -2076,13 +2084,12 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 							const cx = (position.x + w / 2) / stagePxWidth;
 							const cy = (position.y + h / 2) / stagePxHeight;
 							onLayerTransformUpdate(primaryLayerId, {
-								position: {
-									cx: Math.max(0, Math.min(1, cx)),
-									cy: Math.max(0, Math.min(1, cy)),
-								},
+								// cx/cy may sit outside [0, 1] when the layer
+								// straddles the background edge — keep raw.
+								position: { cx, cy },
 								size: {
-									width: Math.max(0.05, Math.min(1, w / stagePxWidth)),
-									height: Math.max(0.05, Math.min(1, h / stagePxHeight)),
+									width: Math.max(0.05, w / stagePxWidth),
+									height: Math.max(0.05, h / stagePxHeight),
 								},
 							});
 						}}
@@ -2596,7 +2603,9 @@ function MultiLayerOverlay({
 						key={`${path}-${idx}`}
 						size={{ width: widthPx, height: heightPx }}
 						position={{ x: xPx, y: yPx }}
-						bounds="parent"
+						// No `bounds` set: Layer 2/3 may be dragged outside the
+						// background area. The composeStageCanvas / export
+						// path clips to the stage rect on render.
 						lockAspectRatio={lockedAspect}
 						minWidth={120}
 						minHeight={68}
@@ -2606,12 +2615,9 @@ function MultiLayerOverlay({
 							if (!layerId || !onUpdate) return;
 							const cx = (d.x + widthPx / 2) / stageWidth;
 							const cy = (d.y + heightPx / 2) / stageHeight;
-							onUpdate(layerId, {
-								position: {
-									cx: Math.max(0, Math.min(1, cx)),
-									cy: Math.max(0, Math.min(1, cy)),
-								},
-							});
+							// Unclamped: cx/cy may be < 0 or > 1 when the tile
+							// straddles the background edge.
+							onUpdate(layerId, { position: { cx, cy } });
 						}}
 						onDragStop={() => {
 							onCommit?.();
@@ -2623,13 +2629,10 @@ function MultiLayerOverlay({
 							const cx = (position.x + w / 2) / stageWidth;
 							const cy = (position.y + h / 2) / stageHeight;
 							onUpdate(layerId, {
-								position: {
-									cx: Math.max(0, Math.min(1, cx)),
-									cy: Math.max(0, Math.min(1, cy)),
-								},
+								position: { cx, cy },
 								size: {
-									width: Math.max(0.05, Math.min(1, w / stageWidth)),
-									height: Math.max(0.05, Math.min(1, h / stageHeight)),
+									width: Math.max(0.05, w / stageWidth),
+									height: Math.max(0.05, h / stageHeight),
 								},
 							});
 						}}

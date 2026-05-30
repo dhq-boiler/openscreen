@@ -3,28 +3,34 @@
  *
  * Composes a v3 multi-layer recording into a single MP4 by playing all
  * layer videos back simultaneously, drawing each frame onto a target
- * canvas in a simple auto-grid layout, and recording the canvas stream
- * with MediaRecorder.
+ * canvas, and recording the canvas stream with MediaRecorder.
  *
- * What this DOES support:
- * - 1..4 video layers, auto-laid-out as full / 1x2 / 2x2.
- * - Audio passthrough from the *primary* layer only.
- * - WebM (vp8/vp9/h264 where available) output.
+ * Layout:
+ * - When `layerTransforms` are supplied, each layer is positioned and
+ *   sized from its LayerTransform (matching the editor preview).
+ *   zOrder controls draw order, `visible:false` skips, and tile
+ *   contents follow the editor's `object-cover` semantics.
+ * - Without transforms (legacy callers), layers fall back to the
+ *   simple auto-grid layout (full / 1x2 / 2x2 / ...).
  *
- * What this does NOT yet support (tracked as Phase 3.5/6 follow-ups in
- * the multi-window-recording-design.md doc):
- * - Editor effects: zoom regions, cursor highlights, annotations, blur,
- *   wallpaper background. The existing FrameRenderer is single-layer
- *   only; integrating multi-layer into it is a larger refactor.
- * - Per-layer transforms (LayerTransform) — layout here is fixed grid.
- * - Audio mixing across multiple layers.
+ * Background:
+ * - `wallpaper` accepts the same string the editor stores: a color
+ *   (hex / rgb(...) / etc.), a CSS gradient, an image path under
+ *   `/wallpapers/`, or a `file://` / `data:` / `http(s)` URL. Colors
+ *   fill the canvas, images draw with `background-size: cover`, and
+ *   gradients fall through to a solid `settings.background` color
+ *   (CSS gradient rendering on `<canvas>` is out of scope here).
  *
- * When a project has these editor features set, the user is warned at
- * export time that the multi-layer path will skip them. Single-layer
- * projects continue to flow through the full FrameRenderer pipeline.
+ * Not yet supported (tracked in multi-window-recording-design.md):
+ * - Zoom regions, cursor highlights, annotations, blur overlays.
+ *   FrameRenderer remains single-layer only; multi-layer projects
+ *   skip those effects on export and the user is warned.
+ * - Audio mixing across multiple layers (primary track only).
  */
 
+import type { LayerTransform } from "@/components/video-editor/projectPersistence";
 import type { ProjectMediaV3 } from "../recordingSession";
+import { classifyWallpaper, resolveImageWallpaperUrl } from "../wallpaper";
 
 export interface MultiLayerExportSettings {
 	/** Target canvas width in CSS pixels. */
@@ -45,6 +51,18 @@ export interface MultiLayerExportProgress {
 export interface MultiLayerExportOptions {
 	media: ProjectMediaV3;
 	settings: MultiLayerExportSettings;
+	/**
+	 * Per-layer transforms keyed by `media.layers[i].id`. When supplied,
+	 * each layer is rendered at its editor-visible position/size/zOrder
+	 * instead of the legacy auto-grid layout.
+	 */
+	layerTransforms?: LayerTransform[];
+	/**
+	 * Wallpaper from editor state (color string, CSS gradient, or image
+	 * path). Drawn under all layers; mirrors the editor preview's
+	 * background div. Gradients fall through to `settings.background`.
+	 */
+	wallpaper?: string;
 	onProgress?: (p: MultiLayerExportProgress) => void;
 	/** Optional abort signal to cancel a running export. */
 	signal?: AbortSignal;
@@ -100,6 +118,118 @@ export function computeGridLayout(n: number, width: number, height: number): Cel
 		});
 	}
 	return cells;
+}
+
+interface TransformedLayer {
+	video: HTMLVideoElement;
+	transform: LayerTransform;
+}
+
+function drawTransformedLayers(
+	ctx: CanvasRenderingContext2D,
+	canvasWidth: number,
+	canvasHeight: number,
+	layers: TransformedLayer[],
+) {
+	// Mirror DOM stacking: smaller zOrder is drawn first (sits under).
+	const sorted = [...layers].sort((a, b) => a.transform.zOrder - b.transform.zOrder);
+	for (const { video, transform } of sorted) {
+		if (transform.visible === false) continue;
+		if (video.readyState < 2) continue;
+		const vw = video.videoWidth;
+		const vh = video.videoHeight;
+		if (vw === 0 || vh === 0) continue;
+
+		const dw = Math.max(1, Math.round(transform.size.width * canvasWidth));
+		const dh = Math.max(1, Math.round(transform.size.height * canvasHeight));
+		const dx = Math.round(transform.position.cx * canvasWidth - dw / 2);
+		const dy = Math.round(transform.position.cy * canvasHeight - dh / 2);
+
+		// Mirror the editor's `object-cover` on `<video>` tiles: center-crop
+		// the source so the visible frame matches the tile aspect.
+		const tileAspect = dw / dh;
+		const videoAspect = vw / vh;
+		let srcX = 0;
+		let srcY = 0;
+		let srcW = vw;
+		let srcH = vh;
+		if (videoAspect > tileAspect) {
+			srcW = vh * tileAspect;
+			srcX = (vw - srcW) / 2;
+		} else if (videoAspect < tileAspect) {
+			srcH = vw / tileAspect;
+			srcY = (vh - srcH) / 2;
+		}
+		try {
+			ctx.drawImage(video, srcX, srcY, srcW, srcH, dx, dy, dw, dh);
+		} catch {
+			// Frame may not be decodable yet — skip.
+		}
+	}
+}
+
+function drawWallpaperImage(
+	ctx: CanvasRenderingContext2D,
+	width: number,
+	height: number,
+	image: HTMLImageElement,
+) {
+	if (!image.complete || image.naturalWidth <= 0 || image.naturalHeight <= 0) return;
+	// CSS `background-size: cover` + `background-position: center`.
+	const imgAspect = image.naturalWidth / image.naturalHeight;
+	const canvasAspect = width / height;
+	let drawW: number;
+	let drawH: number;
+	if (imgAspect > canvasAspect) {
+		drawH = height;
+		drawW = height * imgAspect;
+	} else {
+		drawW = width;
+		drawH = width / imgAspect;
+	}
+	const drawX = (width - drawW) / 2;
+	const drawY = (height - drawH) / 2;
+	try {
+		ctx.drawImage(image, drawX, drawY, drawW, drawH);
+	} catch {
+		// CORS-tainted images throw — fall through to the prior fill.
+	}
+}
+
+async function loadWallpaperImage(url: string): Promise<HTMLImageElement | null> {
+	return new Promise((resolve) => {
+		const img = new Image();
+		img.crossOrigin = "anonymous";
+		img.onload = () => resolve(img);
+		img.onerror = () => resolve(null);
+		img.src = url;
+	});
+}
+
+/**
+ * Resolve the editor's `wallpaper` string into a fill color and (optionally)
+ * a preloaded background image. Gradients fall through to the fallback color
+ * since we can't paint a CSS gradient onto a 2D canvas without a parser.
+ */
+async function resolveWallpaperForExport(
+	wallpaper: string | undefined,
+	fallbackColor: string,
+): Promise<{ color: string; image: HTMLImageElement | null }> {
+	if (!wallpaper) return { color: fallbackColor, image: null };
+	const classified = classifyWallpaper(wallpaper);
+	if (classified.kind === "color") {
+		return { color: classified.value, image: null };
+	}
+	if (classified.kind === "gradient") {
+		return { color: fallbackColor, image: null };
+	}
+	try {
+		const url = resolveImageWallpaperUrl(classified.path);
+		const image = await loadWallpaperImage(url);
+		return { color: fallbackColor, image };
+	} catch {
+		return { color: fallbackColor, image: null };
+	}
 }
 
 function pathToObjectUrlOrSrc(path: string): { src: string; objectUrl?: string } {
@@ -166,7 +296,7 @@ function pickMimeType(): { mime: string; container: "webm" | "mp4" } {
 export async function exportMultiLayer(
 	options: MultiLayerExportOptions,
 ): Promise<MultiLayerExportResult> {
-	const { media, settings, onProgress, signal } = options;
+	const { media, settings, layerTransforms, wallpaper, onProgress, signal } = options;
 	if (media.layers.length === 0) {
 		return { success: false, error: "Cannot export an empty layer list." };
 	}
@@ -197,7 +327,20 @@ export async function exportMultiLayer(
 			return { success: false, error: "Failed to obtain 2D canvas context." };
 		}
 
-		const cells = computeGridLayout(prepared.length, settings.width, settings.height);
+		const transformByLayerId = new Map<string, LayerTransform>();
+		if (layerTransforms) {
+			for (const t of layerTransforms) transformByLayerId.set(t.layerId, t);
+		}
+		// Use transforms when at least one prepared layer has one; otherwise
+		// fall back to the legacy auto-grid layout for backward compat with
+		// callers that don't pass transforms yet.
+		const useTransforms = media.layers.some((l) => transformByLayerId.has(l.id));
+		const cells = useTransforms
+			? []
+			: computeGridLayout(prepared.length, settings.width, settings.height);
+
+		const fallbackBg = settings.background ?? "#000000";
+		const resolvedBackground = await resolveWallpaperForExport(wallpaper, fallbackBg);
 
 		const canvasStream = canvas.captureStream(settings.fps);
 		// Attach primary layer's audio (if present) into the output stream.
@@ -250,7 +393,6 @@ export async function exportMultiLayer(
 		await Promise.all(prepared.map((p) => p.video.play()));
 
 		const primaryDuration = isFinite(primaryVideo.duration) ? primaryVideo.duration : 0;
-		const bgColor = settings.background ?? "#000000";
 
 		let cancelled = false;
 		const abortHandler = () => {
@@ -259,12 +401,37 @@ export async function exportMultiLayer(
 		signal?.addEventListener("abort", abortHandler);
 
 		const drawFrame = () => {
-			ctx.fillStyle = bgColor;
+			ctx.fillStyle = resolvedBackground.color;
 			ctx.fillRect(0, 0, canvas.width, canvas.height);
+			if (resolvedBackground.image) {
+				drawWallpaperImage(ctx, canvas.width, canvas.height, resolvedBackground.image);
+			}
+			if (useTransforms) {
+				const transformedLayers: TransformedLayer[] = [];
+				for (let i = 0; i < prepared.length; i++) {
+					const layerId = media.layers[i].id;
+					const t = transformByLayerId.get(layerId);
+					// Fall back to a centered full-stage tile when a layer
+					// has no transform — better than silently dropping it.
+					const transform: LayerTransform = t ?? {
+						layerId,
+						position: { cx: 0.5, cy: 0.5 },
+						size: { width: 1, height: 1 },
+						rotation: 0,
+						zOrder: i,
+						visible: true,
+					};
+					transformedLayers.push({ video: prepared[i].video, transform });
+				}
+				drawTransformedLayers(ctx, canvas.width, canvas.height, transformedLayers);
+				return;
+			}
+			// Legacy grid layout — preserved for callers that don't pass
+			// transforms yet.
 			for (let i = 0; i < prepared.length; i++) {
 				const cell = cells[i];
 				const v = prepared[i].video;
-				if (v.readyState < 2) continue; // metadata not yet
+				if (v.readyState < 2) continue;
 				const vw = v.videoWidth;
 				const vh = v.videoHeight;
 				if (vw === 0 || vh === 0) continue;
