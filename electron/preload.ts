@@ -31,6 +31,42 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	getSources: async (opts: Electron.SourcesOptions) => {
 		return await ipcRenderer.invoke("get-sources", opts);
 	},
+	enumerateWindowsByProcess: async () => {
+		return (await ipcRenderer.invoke("enumerate-windows-by-process")) as
+			| {
+					schemaVersion: number;
+					windows: Array<{
+						hwnd: number;
+						sourceId: string;
+						pid: number;
+						processName: string;
+						processPath: string;
+						title: string;
+						className: string;
+						x: number;
+						y: number;
+						width: number;
+						height: number;
+					}>;
+			  }
+			| { error: string };
+	},
+	startProcessWindowCapture: (req: {
+		sessionId: string;
+		baseRecordingId: number;
+		pid: number;
+		processName: string;
+		fps?: number;
+		videoWidth?: number;
+		videoHeight?: number;
+		captureCursor?: boolean;
+	}) => ipcRenderer.invoke("start-process-window-capture", req),
+	pauseProcessWindowCapture: (groupId: string) =>
+		ipcRenderer.invoke("pause-process-window-capture", groupId),
+	resumeProcessWindowCapture: (groupId: string) =>
+		ipcRenderer.invoke("resume-process-window-capture", groupId),
+	stopProcessWindowCapture: (groupId: string, opts?: { discard?: boolean }) =>
+		ipcRenderer.invoke("stop-process-window-capture", groupId, opts),
 	switchToEditor: () => {
 		return ipcRenderer.invoke("switch-to-editor");
 	},

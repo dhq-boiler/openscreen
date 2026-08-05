@@ -18,6 +18,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { MdVisibility, MdVisibilityOff } from "react-icons/md";
 import { Rnd } from "react-rnd";
 import {
 	getWebcamLayoutCssBoxShadow,
@@ -55,6 +56,7 @@ import {
 	DEFAULT_EDITOR_LAYOUT_SETTINGS,
 	DEFAULT_SOURCE_DIMENSIONS,
 } from "./editorDefaults";
+import { LayerContextMenu } from "./LayerContextMenu";
 import {
 	type AnnotationRegion,
 	type BlurData,
@@ -119,6 +121,15 @@ interface VideoPlaybackProps {
 	 */
 	additionalLayerIds?: string[];
 	/**
+	 * Start offset (ms) of each additional layer relative to the primary
+	 * timeline anchor. Matches `additionalLayerPaths` positionally. A tile
+	 * with offset `t` is invisible before `currentTime < t` and its
+	 * `<video>.currentTime` is set to `currentTime - t` while it plays.
+	 * Set from `recordedAtMs` on load; 0 for layers that started at the
+	 * same instant as the primary (or legacy manifests missing the field).
+	 */
+	additionalLayerOffsetsMs?: number[];
+	/**
 	 * Phase 6.5: id of the primary layer when the project is multi-source.
 	 * When set, the editor renders the PixiJS canvas inside a draggable +
 	 * resizable Rnd that's driven by `layerTransforms[primaryLayerId]`,
@@ -137,6 +148,9 @@ interface VideoPlaybackProps {
 		layerId: string,
 		partial: Partial<import("./projectPersistence").LayerTransform>,
 	) => void;
+	/** Right-click reorder: change target layer's zOrder relative to peers.
+	 *  Committed as a single history checkpoint by the parent. */
+	onLayerReorder?: (layerId: string, direction: "back" | "backward" | "forward" | "front") => void;
 	/** Phase 4.5: pointer-up commit so undo/redo sees one checkpoint per gesture. */
 	onLayerTransformCommit?: () => void;
 	/**
@@ -291,10 +305,12 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			videoPath,
 			additionalLayerPaths = [],
 			additionalLayerIds = [],
+			additionalLayerOffsetsMs = [],
 			primaryLayerId = null,
 			layerTransforms = [],
 			onLayerTransformUpdate,
 			onLayerTransformCommit,
+			onLayerReorder,
 			moveRegions = [],
 			selectedMoveId = null,
 			onMoveFromChange,
@@ -464,6 +480,16 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		const isScrubbingRef = useRef(false);
 		const scrubEndTimerRef = useRef<number | null>(null);
 		const [isScrubbing, setIsScrubbing] = useState(false);
+		// Right-click reorder menu state. Shared across primary + additional
+		// layer tiles so at most one context menu is open at a time.
+		const [layerContextMenu, setLayerContextMenu] = useState<{
+			layerId: string;
+			x: number;
+			y: number;
+		} | null>(null);
+		const openLayerContextMenu = useCallback((layerId: string, x: number, y: number) => {
+			setLayerContextMenu({ layerId, x, y });
+		}, []);
 		const allowPlaybackRef = useRef(false);
 		const lockedVideoDimensionsRef = useRef<{
 			width: number;
@@ -2174,10 +2200,22 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 										// break the video render.
 										boxShadow: "0 4px 12px rgba(0,0,0,0.5)",
 										cursor: "move",
+										opacity: primaryTransform?.visible === false ? 0.35 : 1,
 									}
 								: { zIndex: 1 }
 						}
 					>
+						{enablePrimaryTile && primaryLayerId && (
+							<div
+								className="absolute inset-0"
+								style={{ pointerEvents: "auto", zIndex: 11 }}
+								onContextMenu={(e) => {
+									e.preventDefault();
+									e.stopPropagation();
+									openLayerContextMenu(primaryLayerId, e.clientX, e.clientY);
+								}}
+							/>
+						)}
 						{enablePrimaryTile && (
 							<div
 								className="pointer-events-none absolute left-1 top-1 rounded bg-black/60 px-1 text-[9px] font-semibold text-white"
@@ -2185,6 +2223,32 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 							>
 								Layer 1
 							</div>
+						)}
+						{enablePrimaryTile && primaryLayerId && onLayerTransformUpdate && (
+							<button
+								type="button"
+								onClick={(e) => {
+									e.stopPropagation();
+									const nextVisible = primaryTransform?.visible === false;
+									onLayerTransformUpdate(primaryLayerId, { visible: nextVisible });
+									onLayerTransformCommit?.();
+								}}
+								onMouseDown={(e) => e.stopPropagation()}
+								onPointerDown={(e) => e.stopPropagation()}
+								className="absolute right-1 top-1 flex h-6 w-6 items-center justify-center rounded bg-black/70 text-white hover:bg-black/90"
+								style={{ pointerEvents: "auto", zIndex: 12 }}
+								title={
+									primaryTransform?.visible === false
+										? "エクスポートに含める"
+										: "エクスポートから除外"
+								}
+							>
+								{primaryTransform?.visible === false ? (
+									<MdVisibilityOff size={14} />
+								) : (
+									<MdVisibility size={14} />
+								)}
+							</button>
 						)}
 						<div
 							ref={composite3DRef}
@@ -2309,9 +2373,11 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					<MultiLayerOverlay
 						paths={additionalLayerPaths}
 						layerIds={additionalLayerIds}
+						offsetsMs={additionalLayerOffsetsMs}
 						transforms={effectiveLayerTransforms}
 						onUpdate={onLayerTransformUpdate}
 						onCommit={onLayerTransformCommit}
+						onOpenContextMenu={openLayerContextMenu}
 						isPlaying={isPlaying}
 						currentTime={currentTime}
 					/>
@@ -2543,6 +2609,18 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 						/>
 					</div>
 				)}
+				{layerContextMenu && (
+					<LayerContextMenu
+						x={layerContextMenu.x}
+						y={layerContextMenu.y}
+						onReorder={(direction) => {
+							if (onLayerReorder) {
+								onLayerReorder(layerContextMenu.layerId, direction);
+							}
+						}}
+						onClose={() => setLayerContextMenu(null)}
+					/>
+				)}
 			</div>
 		);
 	},
@@ -2561,20 +2639,24 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 function MultiLayerOverlay({
 	paths,
 	layerIds,
+	offsetsMs,
 	transforms,
 	onUpdate,
 	onCommit,
+	onOpenContextMenu,
 	isPlaying,
 	currentTime,
 }: {
 	paths: string[];
 	layerIds: string[];
+	offsetsMs?: number[];
 	transforms: import("./projectPersistence").LayerTransform[];
 	onUpdate?: (
 		layerId: string,
 		partial: Partial<import("./projectPersistence").LayerTransform>,
 	) => void;
 	onCommit?: () => void;
+	onOpenContextMenu?: (layerId: string, x: number, y: number) => void;
 	isPlaying: boolean;
 	currentTime: number;
 }) {
@@ -2593,6 +2675,11 @@ function MultiLayerOverlay({
 	// tiles. Since user resize keeps the same aspect (lockAspectRatio),
 	// even if this runs again the result is mathematically the same shape.
 	const initialAspectSyncedRef = useRef<Set<string>>(new Set());
+	// Per-layer video duration (seconds), populated on loadedmetadata. Used
+	// to hide the tile once its recording has finished — a dialog that only
+	// existed between 6s and 15s should not linger frozen for the rest of
+	// the composed timeline.
+	const [naturalDurationsSec, setNaturalDurationsSec] = useState<Record<string, number>>({});
 
 	useEffect(() => {
 		const el = containerRef.current;
@@ -2607,11 +2694,36 @@ function MultiLayerOverlay({
 	}, []);
 
 	useEffect(() => {
-		for (const video of videoRefs.current) {
+		for (let idx = 0; idx < videoRefs.current.length; idx++) {
+			const video = videoRefs.current[idx];
 			if (!video) continue;
-			if (Math.abs(video.currentTime - currentTime) > 0.25) {
+			const offsetSec = ((offsetsMs && offsetsMs[idx]) ?? 0) / 1000;
+			const localTime = currentTime - offsetSec;
+			const duration = Number.isFinite(video.duration) ? video.duration : Infinity;
+			// Layer hasn't opened yet, or has already closed (mp4 finished).
+			// Pause it and hold it at frame 0 / last frame so a scrub back into
+			// its window resumes cleanly.
+			if (localTime < 0 || localTime > duration + 0.05) {
+				if (!video.paused) {
+					try {
+						video.pause();
+					} catch {
+						// Element may already be detached; ignore.
+					}
+				}
+				const targetTime = localTime < 0 ? 0 : Math.max(0, duration);
+				if (Math.abs(video.currentTime - targetTime) > 0.05) {
+					try {
+						video.currentTime = targetTime;
+					} catch {
+						// Seek before metadata loads — retried next tick.
+					}
+				}
+				continue;
+			}
+			if (Math.abs(video.currentTime - localTime) > 0.25) {
 				try {
-					video.currentTime = currentTime;
+					video.currentTime = localTime;
 				} catch {
 					// Seek may fail before metadata loads — next tick will retry.
 				}
@@ -2622,7 +2734,7 @@ function MultiLayerOverlay({
 				video.pause();
 			}
 		}
-	}, [isPlaying, currentTime]);
+	}, [isPlaying, currentTime, offsetsMs]);
 
 	if (paths.length === 0) return null;
 
@@ -2660,6 +2772,24 @@ function MultiLayerOverlay({
 
 				const canEdit = Boolean(transform && layerId && onUpdate);
 				const lockedAspect = layerId && naturalAspects[layerId] ? naturalAspects[layerId] : 16 / 9;
+
+				// In-range = the layer's recording covers currentTime. Out of
+				// range → hide the video content (a mid-recording dialog only
+				// shows during the window it was actually captured).
+				// While paused, keep the tile visible as an editable
+				// placeholder so the user can pre-arrange position/size for
+				// a layer that has not appeared yet in the playhead's
+				// current spot. During playback, out-of-range tiles are
+				// fully hidden so the composed preview stays honest.
+				const offsetSec = ((offsetsMs && offsetsMs[idx]) ?? 0) / 1000;
+				const durationSec = layerId ? naturalDurationsSec[layerId] : undefined;
+				const localTime = currentTime - offsetSec;
+				const upperBound =
+					typeof durationSec === "number" && Number.isFinite(durationSec)
+						? durationSec + 0.05
+						: Number.POSITIVE_INFINITY;
+				const inTimeRange = localTime >= 0 && localTime <= upperBound;
+				const showAsPlaceholder = !inTimeRange && !isPlaying;
 
 				return (
 					<Rnd
@@ -2703,16 +2833,36 @@ function MultiLayerOverlay({
 							onCommit?.();
 						}}
 						style={{
-							border: "1px solid rgba(255,255,255,0.3)",
+							border: showAsPlaceholder
+								? "1px dashed rgba(120, 180, 255, 0.7)"
+								: "1px solid rgba(255,255,255,0.3)",
 							borderRadius: 6,
 							overflow: "hidden",
-							background: "rgba(0,0,0,0.6)",
+							background: showAsPlaceholder ? "rgba(30, 60, 100, 0.35)" : "rgba(0,0,0,0.6)",
 							boxShadow: "0 4px 12px rgba(0,0,0,0.5)",
-							pointerEvents: "auto",
+							// Placeholder tiles are pointer-interactive so the
+							// user can drag/resize them before the layer's
+							// recording actually starts.
+							pointerEvents: inTimeRange || showAsPlaceholder ? "auto" : "none",
 							// Phase 8 z-order: pull from transform so the
 							// Layer order UI in SettingsPanel controls which
 							// tile sits on top of which.
 							zIndex: 10 + (transform?.zOrder ?? idx),
+							// Three visibility axes:
+							// - inTimeRange && transform.visible: full opacity
+							// - inTimeRange && !visible: user excluded from
+							//   export → dim
+							// - !inTimeRange && paused: placeholder → semi-
+							//   transparent so it doesn't dominate the
+							//   preview but is still adjustable
+							// - !inTimeRange && playing: fully hidden
+							opacity: !inTimeRange
+								? showAsPlaceholder
+									? 0.55
+									: 0
+								: transform?.visible === false
+									? 0.35
+									: 1,
 						}}
 					>
 						<video
@@ -2724,6 +2874,7 @@ function MultiLayerOverlay({
 							playsInline
 							preload="auto"
 							className="h-full w-full object-cover pointer-events-none select-none"
+							style={{ visibility: showAsPlaceholder ? "hidden" : "visible" }}
 							draggable={false}
 							// Phase 11 Step 3: composeStageCanvas reads Layer 2/3
 							// video frames via this data attribute so the blur
@@ -2737,6 +2888,12 @@ function MultiLayerOverlay({
 								setNaturalAspects((prev) =>
 									prev[layerId] === aspect ? prev : { ...prev, [layerId]: aspect },
 								);
+								if (Number.isFinite(v.duration) && v.duration > 0) {
+									const dur = v.duration;
+									setNaturalDurationsSec((prev) =>
+										prev[layerId] === dur ? prev : { ...prev, [layerId]: dur },
+									);
+								}
 								// Initial aspect sync: scale the persisted
 								// transform's height to match the natural
 								// aspect, keeping width constant. Runs once
@@ -2756,9 +2913,60 @@ function MultiLayerOverlay({
 								onCommit?.();
 							}}
 						/>
+						{layerId && onOpenContextMenu && (
+							<div
+								className="absolute inset-0"
+								style={{ pointerEvents: "auto" }}
+								onContextMenu={(e) => {
+									e.preventDefault();
+									e.stopPropagation();
+									onOpenContextMenu(layerId, e.clientX, e.clientY);
+								}}
+							/>
+						)}
 						<div className="pointer-events-none absolute left-1 top-1 rounded bg-black/60 px-1 text-[9px] font-semibold text-white">
 							{`Layer ${idx + 2}`}
 						</div>
+						{showAsPlaceholder && (
+							<div
+								className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-0.5 text-center text-[10px] text-blue-100/85"
+								style={{ textShadow: "0 1px 2px rgba(0,0,0,0.65)" }}
+							>
+								<div className="font-semibold text-white/90">{`Layer ${idx + 2}`}</div>
+								<div>
+									{(() => {
+										const total = Math.max(0, Math.round(offsetSec));
+										const m = Math.floor(total / 60);
+										const s = total % 60;
+										return `${m}:${s.toString().padStart(2, "0")} に出現`;
+									})()}
+								</div>
+							</div>
+						)}
+						{layerId && onUpdate && (
+							<button
+								type="button"
+								onClick={(e) => {
+									e.stopPropagation();
+									const nextVisible = transform?.visible === false;
+									onUpdate(layerId, { visible: nextVisible });
+									onCommit?.();
+								}}
+								onMouseDown={(e) => e.stopPropagation()}
+								onPointerDown={(e) => e.stopPropagation()}
+								className="absolute right-1 top-1 flex h-6 w-6 items-center justify-center rounded bg-black/70 text-white hover:bg-black/90"
+								style={{ pointerEvents: "auto" }}
+								title={
+									transform?.visible === false ? "エクスポートに含める" : "エクスポートから除外"
+								}
+							>
+								{transform?.visible === false ? (
+									<MdVisibilityOff size={14} />
+								) : (
+									<MdVisibility size={14} />
+								)}
+							</button>
+						)}
 					</Rnd>
 				);
 			})}

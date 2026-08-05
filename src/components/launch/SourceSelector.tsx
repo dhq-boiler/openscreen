@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { MdCheck } from "react-icons/md";
 import { useScopedT } from "@/contexts/I18nContext";
 import { Button } from "../ui/button";
@@ -13,21 +13,30 @@ interface DesktopSource {
 	appIcon: string | null;
 }
 
-/**
- * Maximum number of sources the user can pick at once. Above 4 the layout
- * gets messy in the editor and the GPU cost starts to bite. The native
- * helper itself has no hard limit — this is a UX cap.
- */
-const MAX_MULTI_SELECTION = 4;
+interface ProcessGroup {
+	processKey: string; // stable "<pid>|<processName>" key
+	pid: number;
+	processName: string;
+	processPath: string;
+	// Preview only — process capture at record time uses PID directly and
+	// picks up windows dialog-and-all, including ones desktopCapturer never
+	// lists and ones that appear mid-recording.
+	previewSources: DesktopSource[];
+	windowCount: number; // count of enumerated windows (may exceed previewSources)
+	sampleAppIcon: string | null;
+	sampleThumbnail: string | null;
+}
 
 export function SourceSelector() {
 	const t = useScopedT("launch");
 	const tc = useScopedT("common");
 	const [sources, setSources] = useState<DesktopSource[]>([]);
 	const [selectedSourceIds, setSelectedSourceIds] = useState<string[]>([]);
+	const [processGroups, setProcessGroups] = useState<ProcessGroup[]>([]);
 	const [loading, setLoading] = useState(true);
 
 	useEffect(() => {
+		let cancelled = false;
 		async function fetchSources() {
 			setLoading(true);
 			try {
@@ -36,44 +45,148 @@ export function SourceSelector() {
 					thumbnailSize: { width: 320, height: 180 },
 					fetchWindowIcons: true,
 				});
-				setSources(
-					rawSources.map((source) => ({
-						id: source.id,
-						name:
-							source.id.startsWith("window:") && source.name.includes(" — ")
-								? source.name.split(" — ")[1] || source.name
-								: source.name,
-						thumbnail: source.thumbnail,
-						display_id: source.display_id,
-						appIcon: source.appIcon,
-					})),
-				);
+				const processed: DesktopSource[] = rawSources.map((source) => ({
+					id: source.id,
+					name:
+						source.id.startsWith("window:") && source.name.includes(" — ")
+							? source.name.split(" — ")[1] || source.name
+							: source.name,
+					thumbnail: source.thumbnail,
+					display_id: source.display_id,
+					appIcon: source.appIcon,
+				}));
+				if (cancelled) return;
+				setSources(processed);
+
+				// Process enumeration runs in parallel with the picker becoming
+				// interactive. Failure just leaves the "Processes" tab empty;
+				// the Screens / Windows tabs still work.
+				try {
+					const enumResult = await window.electronAPI.enumerateWindowsByProcess();
+					if (cancelled) return;
+					if ("windows" in enumResult) {
+						const bySourceId = new Map(processed.map((s) => [s.id, s]));
+						const groups = new Map<
+							string,
+							{
+								group: ProcessGroup;
+								countedHwnds: Set<number>;
+							}
+						>();
+						for (const w of enumResult.windows) {
+							// Skip the source-picker window itself (an Electron
+							// child window) — it disappears at record time so
+							// it would just clutter the picker.
+							if (w.processName?.toLowerCase() === "openscreen.exe") continue;
+							const key = `${w.pid}|${w.processName || "unknown"}`;
+							let entry = groups.get(key);
+							if (!entry) {
+								entry = {
+									group: {
+										processKey: key,
+										pid: w.pid,
+										processName: w.processName || "Unknown",
+										processPath: w.processPath || "",
+										previewSources: [],
+										windowCount: 0,
+										sampleAppIcon: null,
+										sampleThumbnail: null,
+									},
+									countedHwnds: new Set(),
+								};
+								groups.set(key, entry);
+							}
+							if (entry.countedHwnds.has(w.hwnd)) continue;
+							entry.countedHwnds.add(w.hwnd);
+							entry.group.windowCount += 1;
+
+							// Attach a desktopCapturer preview if Chromium
+							// happens to know this window. Dialogs / owned
+							// popups usually don't appear here — that's fine,
+							// they still get captured at record time via WGC.
+							const known = bySourceId.get(w.sourceId);
+							if (known) {
+								entry.group.previewSources.push(known);
+								if (!entry.group.sampleThumbnail && known.thumbnail) {
+									entry.group.sampleThumbnail = known.thumbnail;
+								}
+								if (!entry.group.sampleAppIcon && known.appIcon) {
+									entry.group.sampleAppIcon = known.appIcon;
+								}
+							}
+						}
+						setProcessGroups(
+							Array.from(groups.values())
+								.map((e) => e.group)
+								.filter((g) => g.windowCount > 0)
+								.sort((a, b) => {
+									if (b.windowCount !== a.windowCount) {
+										return b.windowCount - a.windowCount;
+									}
+									return a.processName.localeCompare(b.processName);
+								}),
+						);
+					}
+				} catch (enumError) {
+					console.warn("Failed to enumerate windows by process:", enumError);
+				}
 			} catch (error) {
 				console.error("Error loading sources:", error);
 			} finally {
-				setLoading(false);
+				if (!cancelled) setLoading(false);
 			}
 		}
 		fetchSources();
+		return () => {
+			cancelled = true;
+		};
 	}, []);
 
-	const screenSources = sources.filter((s) => s.id.startsWith("screen:"));
-	const windowSources = sources.filter((s) => s.id.startsWith("window:"));
-	const sourcesById = new Map(sources.map((s) => [s.id, s]));
-	const selectedSources = selectedSourceIds
-		.map((id) => sourcesById.get(id))
-		.filter((s): s is DesktopSource => Boolean(s));
+	const screenSources = useMemo(() => sources.filter((s) => s.id.startsWith("screen:")), [sources]);
+	const windowSources = useMemo(() => sources.filter((s) => s.id.startsWith("window:")), [sources]);
+	// Synthetic sources built for process-tab selection. Their id has a
+	// dedicated `process:` prefix so useScreenRecorder / handlers.ts can
+	// route them through the process-capture orchestrator (records every
+	// visible window of the pid + follows new dialogs mid-recording).
+	const processSyntheticSources = useMemo<DesktopSource[]>(
+		() =>
+			processGroups.map((g) => ({
+				id: `process:${g.pid}:${g.processName}`,
+				name: g.processName,
+				thumbnail: g.sampleThumbnail,
+				display_id: "",
+				appIcon: g.sampleAppIcon,
+			})),
+		[processGroups],
+	);
+	const sourcesById = useMemo(
+		() => new Map([...sources, ...processSyntheticSources].map((s) => [s.id, s])),
+		[sources, processSyntheticSources],
+	);
+	const selectedSources = useMemo(
+		() =>
+			selectedSourceIds
+				.map((id) => sourcesById.get(id))
+				.filter((s): s is DesktopSource => Boolean(s)),
+		[selectedSourceIds, sourcesById],
+	);
 
 	const toggleSource = (source: DesktopSource) => {
 		setSelectedSourceIds((prev) => {
 			if (prev.includes(source.id)) {
 				return prev.filter((id) => id !== source.id);
 			}
-			if (prev.length >= MAX_MULTI_SELECTION) {
-				// Replace the oldest selection so the cap stays at MAX.
-				return [...prev.slice(1), source.id];
-			}
 			return [...prev, source.id];
+		});
+	};
+
+	const toggleProcessGroup = (group: ProcessGroup) => {
+		const processSourceId = `process:${group.pid}:${group.processName}`;
+		setSelectedSourceIds((prev) => {
+			if (prev.includes(processSourceId)) {
+				return prev.filter((id) => id !== processSourceId);
+			}
+			return [...prev, processSourceId];
 		});
 	};
 
@@ -141,19 +254,65 @@ export function SourceSelector() {
 		);
 	};
 
+	const renderProcessCard = (group: ProcessGroup) => {
+		const processSourceId = `process:${group.pid}:${group.processName}`;
+		const isSelected = selectedSourceIds.includes(processSourceId);
+		return (
+			<div
+				key={group.processKey}
+				className={`${styles.sourceCard} ${isSelected ? styles.selected : ""} p-1.5`}
+				onClick={() => toggleProcessGroup(group)}
+				title={group.processPath || group.processName}
+			>
+				<div className="relative mb-1.5 overflow-hidden rounded-lg border border-white/[0.06] bg-black/30">
+					{group.sampleThumbnail ? (
+						<img
+							src={group.sampleThumbnail}
+							alt={group.processName}
+							className="w-full aspect-video object-cover opacity-80"
+						/>
+					) : (
+						<div className="w-full aspect-video" />
+					)}
+					{isSelected && (
+						<div className="absolute right-1.5 top-1.5">
+							<div className={styles.checkBadge}>
+								<MdCheck size={11} className="text-white" />
+							</div>
+						</div>
+					)}
+					<div className="absolute left-1.5 bottom-1.5 rounded-md bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">
+						{t("sourceSelector.processWindowCount", { count: String(group.windowCount) })}
+					</div>
+				</div>
+				<div className="flex items-center gap-1.5 px-1 pb-0.5">
+					{group.sampleAppIcon && (
+						<img src={group.sampleAppIcon} alt="" className={`${styles.icon} flex-shrink-0`} />
+					)}
+					<div className={`${styles.name} truncate`}>{group.processName}</div>
+				</div>
+			</div>
+		);
+	};
+
 	const selectionHint =
 		selectedSources.length > 1
-			? `${selectedSources.length} sources selected — they will be recorded in parallel.`
+			? t("sourceSelector.selectionHint", { count: String(selectedSources.length) })
 			: null;
+
+	const showProcessesTab = processGroups.length > 0;
+	const defaultTab =
+		screenSources.length === 0 ? (showProcessesTab ? "processes" : "windows") : "screens";
 
 	return (
 		<div className={`min-h-screen flex flex-col ${styles.glassContainer}`}>
 			<div className="flex-1 flex flex-col w-full px-3.5 pt-3.5">
-				<Tabs
-					defaultValue={screenSources.length === 0 ? "windows" : "screens"}
-					className="flex-1 flex flex-col"
-				>
-					<TabsList className="mb-3 grid h-8 grid-cols-2 rounded-xl border border-white/[0.06] bg-white/[0.04] p-0.5">
+				<Tabs defaultValue={defaultTab} className="flex-1 flex flex-col">
+					<TabsList
+						className={`mb-3 grid h-8 ${
+							showProcessesTab ? "grid-cols-3" : "grid-cols-2"
+						} rounded-xl border border-white/[0.06] bg-white/[0.04] p-0.5`}
+					>
 						<TabsTrigger
 							value="screens"
 							className="rounded-lg py-1 text-[11px] text-zinc-400 transition-all data-[state=active]:bg-white/[0.12] data-[state=active]:text-white"
@@ -166,6 +325,14 @@ export function SourceSelector() {
 						>
 							{t("sourceSelector.windows", { count: String(windowSources.length) })}
 						</TabsTrigger>
+						{showProcessesTab && (
+							<TabsTrigger
+								value="processes"
+								className="rounded-lg py-1 text-[11px] text-zinc-400 transition-all data-[state=active]:bg-white/[0.12] data-[state=active]:text-white"
+							>
+								{t("sourceSelector.processes", { count: String(processGroups.length) })}
+							</TabsTrigger>
+						)}
 					</TabsList>
 					<div className="flex-1 min-h-0">
 						<TabsContent value="screens" className="h-full mt-0">
@@ -182,6 +349,15 @@ export function SourceSelector() {
 								{windowSources.map(renderSourceCard)}
 							</div>
 						</TabsContent>
+						{showProcessesTab && (
+							<TabsContent value="processes" className="h-full mt-0">
+								<div
+									className={`grid h-[282px] auto-rows-min grid-cols-2 gap-2.5 overflow-y-auto pr-1.5 pt-1 ${styles.sourceGridScroll}`}
+								>
+									{processGroups.map(renderProcessCard)}
+								</div>
+							</TabsContent>
+						)}
 					</div>
 				</Tabs>
 			</div>

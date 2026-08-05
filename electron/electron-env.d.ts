@@ -28,6 +28,70 @@ interface Window {
 			request: import("../src/native/contracts").NativeBridgeRequest,
 		) => Promise<import("../src/native/contracts").NativeBridgeResponse<TData>>;
 		getSources: (opts: Electron.SourcesOptions) => Promise<ProcessedDesktopSource[]>;
+		enumerateWindowsByProcess: () => Promise<
+			| {
+					schemaVersion: number;
+					windows: Array<{
+						hwnd: number;
+						sourceId: string;
+						pid: number;
+						processName: string;
+						processPath: string;
+						title: string;
+						className: string;
+						x: number;
+						y: number;
+						width: number;
+						height: number;
+					}>;
+			  }
+			| { error: string }
+		>;
+		startProcessWindowCapture: (req: {
+			sessionId: string;
+			baseRecordingId: number;
+			pid: number;
+			processName: string;
+			fps?: number;
+			videoWidth?: number;
+			videoHeight?: number;
+			captureCursor?: boolean;
+		}) => Promise<
+			| {
+					success: true;
+					groupId: string;
+					layers: Array<{
+						layerId: string;
+						recordingId: number;
+						screenVideoPath: string;
+						sourceLabel: string;
+						sourceWidth: number;
+						sourceHeight: number;
+						recordedAtMs: number;
+					}>;
+			  }
+			| { success: false; error: string }
+		>;
+		pauseProcessWindowCapture: (groupId: string) => Promise<{ success: boolean; error?: string }>;
+		resumeProcessWindowCapture: (groupId: string) => Promise<{ success: boolean; error?: string }>;
+		stopProcessWindowCapture: (
+			groupId: string,
+			opts?: { discard?: boolean },
+		) => Promise<
+			| {
+					success: true;
+					layers: Array<{
+						layerId: string;
+						recordingId: number;
+						screenVideoPath: string;
+						sourceLabel: string;
+						sourceWidth: number;
+						sourceHeight: number;
+						recordedAtMs: number;
+					}>;
+			  }
+			| { success: false; error: string }
+		>;
 		switchToEditor: () => Promise<void>;
 		switchToHud: () => Promise<void>;
 		startNewRecording: () => Promise<{ success: boolean; error?: string }>;

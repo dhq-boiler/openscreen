@@ -152,6 +152,15 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	const multiSourcePrepared = useRef<PreparedMultiSourceRecording | null>(null);
 	const multiSourcePreparedRunId = useRef<number | null>(null);
 	const multiSourcePreparedBaseRecordingId = useRef<number | null>(null);
+	// Process capture: recording every window of a specific PID with a
+	// mid-recording watcher that adds new HWNDs (dialogs) as extra layers.
+	// Populated when the user picked a `process:<pid>:<name>` source from
+	// the SourceSelector. Distinct from multi-source because the layer
+	// count grows over time; the orchestrator lives entirely in the main
+	// process and just returns a groupId + the current layer list.
+	const processCaptureGroupId = useRef<string | null>(null);
+	const processCaptureSessionId = useRef<string | null>(null);
+	const processCaptureBaseRecordingId = useRef<number | null>(null);
 	const stream = useRef<MediaStream | null>(null);
 	const screenStream = useRef<MediaStream | null>(null);
 	const microphoneStream = useRef<MediaStream | null>(null);
@@ -171,7 +180,8 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	const canPauseRecording =
 		recording &&
 		Boolean(
-			multiSourceRecording.current ||
+			processCaptureGroupId.current ||
+				multiSourceRecording.current ||
 				(nativeWindowsRecording.current && !nativeWindowsRecording.current.finalizing) ||
 				(nativeMacRecording.current && !nativeMacRecording.current.finalizing) ||
 				(screenRecorder.current && screenRecorder.current.recorder.state !== "inactive"),
@@ -641,6 +651,10 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	);
 
 	const stopRecording = useRef(() => {
+		if (processCaptureGroupId.current) {
+			void finalizeProcessCaptureRecording(false);
+			return;
+		}
 		if (multiSourceRecording.current) {
 			void finalizeMultiSourceRecording(false);
 			return;
@@ -842,7 +856,15 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 					return true;
 				}
 
-				const writeResult = await window.electronAPI.writeMultiSourceSessionManifest(media);
+				// Persist the cursor mode so the editor knows whether the primary
+				// layer expects the editable overlay (layer 0 records with the
+				// user-selected mode; non-primary layers always bake the system
+				// cursor). Without this the v3 manifest loads with no mode and
+				// the editor never draws the overlay cursor.
+				const writeResult = await window.electronAPI.writeMultiSourceSessionManifest({
+					...media,
+					cursorCaptureMode,
+				});
 				if (!writeResult.success) {
 					console.error("Failed to write multi-source session manifest:", writeResult.error);
 					toast.error("Failed to save multi-window recording session.");
@@ -872,8 +894,201 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				return true;
 			}
 		},
+		[teardownMedia, cursorCaptureMode],
+	);
+
+	// ─────────────────────────────────────────────────────────────────
+	// Process capture (record every window of a PID).
+	// ─────────────────────────────────────────────────────────────────
+
+	const finalizeProcessCaptureRecording = useCallback(
+		async (discard = false) => {
+			const groupId = processCaptureGroupId.current;
+			const sessionId = processCaptureSessionId.current;
+			if (!groupId || !sessionId) return false;
+
+			processCaptureGroupId.current = null;
+			processCaptureSessionId.current = null;
+			processCaptureBaseRecordingId.current = null;
+
+			try {
+				const stopResult = await window.electronAPI.stopProcessWindowCapture(groupId, {
+					discard,
+				});
+				if (discard || !stopResult.success) {
+					setRecording(false);
+					setPaused(false);
+					setElapsedSeconds(0);
+					accumulatedDurationMs.current = 0;
+					segmentStartedAt.current = null;
+					teardownMedia();
+					if (!stopResult.success && !discard) {
+						toast.error(
+							`Process capture failed to stop: ${
+								("error" in stopResult && stopResult.error) || "unknown error"
+							}`,
+						);
+					}
+					return true;
+				}
+
+				if (stopResult.layers.length === 0) {
+					toast.error("No windows were captured for the selected process.");
+					setRecording(false);
+					setPaused(false);
+					setElapsedSeconds(0);
+					accumulatedDurationMs.current = 0;
+					segmentStartedAt.current = null;
+					teardownMedia();
+					return true;
+				}
+
+				const media: import("@/lib/recordingSession").ProjectMediaV3 = {
+					schemaVersion: 3,
+					sessionId,
+					// Process capture always bakes the OS cursor into each
+					// sub-mp4 (captureCursor: true at start), so mark the
+					// session "system" regardless of the launcher toggle —
+					// the editor must not draw an overlay on the baked cursor.
+					cursorCaptureMode: "system",
+					layers: stopResult.layers.map((layer) => ({
+						id: layer.layerId,
+						kind: "window",
+						screenVideoPath: layer.screenVideoPath,
+						recordedAtMs: layer.recordedAtMs,
+						...(layer.sourceLabel ? { sourceLabel: layer.sourceLabel } : {}),
+						...(layer.sourceWidth > 0 ? { sourceWidth: layer.sourceWidth } : {}),
+						...(layer.sourceHeight > 0 ? { sourceHeight: layer.sourceHeight } : {}),
+					})),
+				};
+
+				const writeResult = await window.electronAPI.writeMultiSourceSessionManifest(media);
+				if (!writeResult.success) {
+					console.error("Failed to write process-capture session manifest:", writeResult.error);
+					toast.error("Failed to save process-capture recording session.");
+				}
+
+				setRecording(false);
+				setPaused(false);
+				setElapsedSeconds(0);
+				accumulatedDurationMs.current = 0;
+				segmentStartedAt.current = null;
+				teardownMedia();
+				await window.electronAPI.switchToEditor();
+				return true;
+			} catch (error) {
+				console.error("Process capture finalize failed:", error);
+				toast.error(
+					`Process capture failed to stop: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+				setRecording(false);
+				setPaused(false);
+				setElapsedSeconds(0);
+				accumulatedDurationMs.current = 0;
+				segmentStartedAt.current = null;
+				teardownMedia();
+				return true;
+			}
+		},
 		[teardownMedia],
 	);
+
+	/** Parse a process:<pid>:<name> source id. Returns null on other prefixes. */
+	const parseProcessSourceId = (id: string): { pid: number; processName: string } | null => {
+		if (!id.startsWith("process:")) return null;
+		const rest = id.slice("process:".length);
+		const firstColon = rest.indexOf(":");
+		if (firstColon <= 0) return null;
+		const pidStr = rest.slice(0, firstColon);
+		const processName = rest.slice(firstColon + 1);
+		const pid = Number(pidStr);
+		if (!Number.isFinite(pid) || pid <= 0) return null;
+		return { pid, processName };
+	};
+
+	const startProcessCaptureIfSelected = async (
+		selectedSources: ProcessedDesktopSource[],
+		countdownRunToken?: number,
+	): Promise<boolean> => {
+		const processSources = selectedSources
+			.map((s) => ({ source: s, parsed: parseProcessSourceId(s.id) }))
+			.filter(
+				(
+					entry,
+				): entry is {
+					source: ProcessedDesktopSource;
+					parsed: { pid: number; processName: string };
+				} => Boolean(entry.parsed),
+			);
+		if (processSources.length === 0) return false;
+		if (processSources.length !== selectedSources.length) {
+			toast.error(
+				"プロセスキャプチャは他のソースと混在できないっす。プロセスだけ選ぶか、他のソースだけ選ぶかにしてほしいっす。",
+			);
+			return true; // handled (with failure)
+		}
+		if (processSources.length > 1) {
+			toast.error("複数プロセスの同時キャプチャはまだ対応してないっす。");
+			return true;
+		}
+		if (!isCountdownRunActive(countdownRunToken)) return true;
+
+		const platform = await window.electronAPI.getPlatform();
+		if (platform !== "win32") {
+			toast.error("Process capture is only supported on Windows.");
+			return true;
+		}
+
+		const { pid, processName } = processSources[0].parsed;
+		const sessionId = newSessionId();
+		const baseRecordingId = newRecordingId();
+
+		try {
+			const result = await window.electronAPI.startProcessWindowCapture({
+				sessionId,
+				baseRecordingId,
+				pid,
+				processName,
+				fps: TARGET_FRAME_RATE,
+				videoWidth: TARGET_WIDTH,
+				videoHeight: TARGET_HEIGHT,
+				// Process capture always bakes the OS cursor into every sub-mp4
+				// regardless of the user's cursor mode. The editable-overlay
+				// path relies on a per-layer cursor sampler + editor overlay we
+				// don't run for process capture; without baking the user would
+				// end up with no cursor visible at all. Matches the existing
+				// multi-source policy where non-primary layers always use the
+				// system cursor.
+				captureCursor: true,
+			});
+			if (!result.success) {
+				toast.error(`Process capture failed to start: ${result.error}`);
+				return true;
+			}
+			processCaptureGroupId.current = result.groupId;
+			processCaptureSessionId.current = sessionId;
+			processCaptureBaseRecordingId.current = baseRecordingId;
+
+			setRecording(true);
+			setPaused(false);
+			recordingId.current = baseRecordingId;
+			accumulatedDurationMs.current = 0;
+			segmentStartedAt.current = Date.now();
+			setElapsedSeconds(0);
+			allowAutoFinalize.current = true;
+			return true;
+		} catch (error) {
+			console.error("Failed to start process capture:", error);
+			toast.error(
+				`Process capture failed to start: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+			return true;
+		}
+	};
 
 	/**
 	 * Multi-source entrypoint. Called from startRecording when the user
@@ -1481,7 +1696,11 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 		void (async () => {
 			try {
 				const sources = await window.electronAPI.getSelectedSources();
-				if (sources.length > 1) {
+				// Skip multi-source prepare when a process source is present —
+				// the process-capture orchestrator has its own start-time
+				// flow (spawns helpers at record moment, no prepare window).
+				const hasProcessSource = sources.some((s) => s.id.startsWith("process:"));
+				if (!hasProcessSource && sources.length > 1) {
 					await prepareMultiSourceIfMultiSelected(sources, runId);
 				}
 			} catch (error) {
@@ -1541,6 +1760,13 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			// sources. Falls back to the single-source flow when the user
 			// only picked one (or the API returns an empty list).
 			const selectedSources = await window.electronAPI.getSelectedSources();
+			// Process capture takes precedence: `process:<pid>:<name>` sources
+			// need dynamic HWND tracking that neither multi-source nor
+			// single-source paths support. Returns true if any process source
+			// was selected — including error cases (mixing / unsupported OS).
+			if (await startProcessCaptureIfSelected(selectedSources, countdownRunToken)) {
+				return;
+			}
 			if (selectedSources.length > 1) {
 				if (await startMultiSourceIfMultiSelected(selectedSources, countdownRunToken)) {
 					return;
@@ -1821,6 +2047,32 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	};
 
 	const togglePaused = () => {
+		const activeProcessGroupId = processCaptureGroupId.current;
+		if (activeProcessGroupId) {
+			void (async () => {
+				try {
+					if (paused) {
+						const r = await window.electronAPI.resumeProcessWindowCapture(activeProcessGroupId);
+						if (!r.success) throw new Error(r.error ?? "Failed to resume process capture");
+						segmentStartedAt.current = Date.now();
+						setPaused(false);
+						return;
+					}
+					const pausedAtMs = getRecordingDurationMs();
+					const r = await window.electronAPI.pauseProcessWindowCapture(activeProcessGroupId);
+					if (!r.success) throw new Error(r.error ?? "Failed to pause process capture");
+					accumulatedDurationMs.current = pausedAtMs;
+					segmentStartedAt.current = null;
+					setElapsedSeconds(Math.floor(accumulatedDurationMs.current / 1000));
+					setPaused(true);
+				} catch (error) {
+					console.error("Failed to toggle process capture pause:", error);
+					toast.error(error instanceof Error ? error.message : "Failed to toggle pause state");
+				}
+			})();
+			return;
+		}
+
 		const activeMultiSource = multiSourceRecording.current;
 		if (activeMultiSource) {
 			void (async () => {

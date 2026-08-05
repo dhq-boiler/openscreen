@@ -2,8 +2,14 @@
  * Phase 3 second-half multi-layer exporter.
  *
  * Composes a v3 multi-layer recording into a single MP4 by playing all
- * layer videos back simultaneously, drawing each frame onto a target
- * canvas, and recording the canvas stream with MediaRecorder.
+ * layer videos back simultaneously, drawing each composited frame onto
+ * a target canvas, and encoding through WebCodecs `VideoEncoder` +
+ * Mediabunny `Mp4OutputFormat` (with `fastStart`) so the resulting MP4
+ * has its `moov` atom up front and is seekable in standard players.
+ *
+ * Audio: the primary layer's audio is demuxed and re-encoded via
+ * `AudioProcessor` into the same MP4. Additional layers contribute
+ * video only (audio mixing across layers is a future follow-up).
  *
  * Layout:
  * - When `layerTransforms` are supplied, each layer is positioned and
@@ -21,18 +27,30 @@
  *   gradients fall through to a solid `settings.background` color
  *   (CSS gradient rendering on `<canvas>` is out of scope here).
  *
+ * Annotations (text / image / figure / blur):
+ * - When `annotationRegions` are supplied, `renderAnnotations` is
+ *   called per frame on top of the composed layers — same rendering
+ *   path the single-layer FrameRenderer uses, so visual parity is
+ *   preserved. Blur samples the already-composed canvas, so it covers
+ *   layer pixels + wallpaper as the user sees in the editor.
+ *
  * Not yet supported (tracked in multi-window-recording-design.md):
- * - Zoom regions, cursor highlights, annotations, blur overlays.
- *   FrameRenderer remains single-layer only; multi-layer projects
- *   skip those effects on export and the user is warned.
+ * - Zoom regions, cursor highlights. FrameRenderer remains single-layer
+ *   only for those; multi-layer projects skip them on export and the
+ *   user is warned.
  * - Audio mixing across multiple layers (primary track only).
  */
 
 import type { LayerTransform } from "@/components/video-editor/projectPersistence";
-import type { MoveRegion } from "@/components/video-editor/types";
+import type { AnnotationRegion, MoveRegion } from "@/components/video-editor/types";
 import { resolveLayerRectAtTime } from "@/components/video-editor/types";
 import type { ProjectMediaV3 } from "../recordingSession";
 import { classifyWallpaper, resolveImageWallpaperUrl } from "../wallpaper";
+import { renderAnnotations } from "./annotationRenderer";
+import { AudioProcessor } from "./audioEncoder";
+import { VideoMuxer } from "./muxer";
+import { StreamingVideoDecoder } from "./streamingDecoder";
+import type { ExportConfig } from "./types";
 
 export interface MultiLayerExportSettings {
 	/** Target canvas width in CSS pixels. */
@@ -71,6 +89,14 @@ export interface MultiLayerExportOptions {
 	 * background div. Gradients fall through to `settings.background`.
 	 */
 	wallpaper?: string;
+	/**
+	 * Text / image / figure / blur annotations from editor state. Drawn
+	 * on top of the composed layers each frame via `renderAnnotations`,
+	 * matching the single-layer FrameRenderer's pipeline so visual
+	 * parity is preserved. Active windows are filtered per frame from
+	 * the primary video's `currentTime`.
+	 */
+	annotationRegions?: AnnotationRegion[];
 	onProgress?: (p: MultiLayerExportProgress) => void;
 	/** Optional abort signal to cancel a running export. */
 	signal?: AbortSignal;
@@ -131,6 +157,11 @@ export function computeGridLayout(n: number, width: number, height: number): Cel
 interface TransformedLayer {
 	video: HTMLVideoElement;
 	transform: LayerTransform;
+	/** True when the current composed timestamp lies inside the layer's
+	 *  recorded window [offsetMs, offsetMs+durationMs]. Layers outside their
+	 *  window are skipped so a mid-session dialog doesn't linger frozen
+	 *  outside the seconds it was actually captured. */
+	inTimeRange: boolean;
 }
 
 function drawTransformedLayers(
@@ -141,8 +172,9 @@ function drawTransformedLayers(
 ) {
 	// Mirror DOM stacking: smaller zOrder is drawn first (sits under).
 	const sorted = [...layers].sort((a, b) => a.transform.zOrder - b.transform.zOrder);
-	for (const { video, transform } of sorted) {
+	for (const { video, transform, inTimeRange } of sorted) {
 		if (transform.visible === false) continue;
+		if (!inTimeRange) continue;
 		if (video.readyState < 2) continue;
 		const vw = video.videoWidth;
 		const vh = video.videoHeight;
@@ -286,25 +318,19 @@ async function prepareLayers(media: ProjectMediaV3): Promise<PreparedLayer[]> {
 	return prepared;
 }
 
-function pickMimeType(): { mime: string; container: "webm" | "mp4" } {
-	const candidates: Array<{ mime: string; container: "webm" | "mp4" }> = [
-		{ mime: "video/webm;codecs=h264,opus", container: "webm" },
-		{ mime: "video/webm;codecs=vp9,opus", container: "webm" },
-		{ mime: "video/webm;codecs=vp8,opus", container: "webm" },
-		{ mime: "video/webm", container: "webm" },
-	];
-	for (const c of candidates) {
-		if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(c.mime)) {
-			return c;
-		}
-	}
-	return { mime: "video/webm", container: "webm" };
-}
-
 export async function exportMultiLayer(
 	options: MultiLayerExportOptions,
 ): Promise<MultiLayerExportResult> {
-	const { media, settings, layerTransforms, moveRegions, wallpaper, onProgress, signal } = options;
+	const {
+		media,
+		settings,
+		layerTransforms,
+		moveRegions,
+		wallpaper,
+		annotationRegions,
+		onProgress,
+		signal,
+	} = options;
 	if (media.layers.length === 0) {
 		return { success: false, error: "Cannot export an empty layer list." };
 	}
@@ -350,32 +376,107 @@ export async function exportMultiLayer(
 		const fallbackBg = settings.background ?? "#000000";
 		const resolvedBackground = await resolveWallpaperForExport(wallpaper, fallbackBg);
 
-		const canvasStream = canvas.captureStream(settings.fps);
-		// Attach primary layer's audio (if present) into the output stream.
 		const primaryVideo = prepared[0].video;
-		try {
-			const primaryStream = (
-				primaryVideo as unknown as { captureStream?: () => MediaStream }
-			).captureStream?.();
-			if (primaryStream) {
-				for (const track of primaryStream.getAudioTracks()) {
-					canvasStream.addTrack(track);
-				}
-			}
-		} catch {
-			// Some platforms restrict video.captureStream — proceed video-only.
-		}
+		const primaryUrl = media.layers[0].screenVideoPath;
 
-		const { mime } = pickMimeType();
-		const chunks: Blob[] = [];
-		const recorder = new MediaRecorder(canvasStream, { mimeType: mime });
-		recorder.ondataavailable = (ev) => {
-			if (ev.data && ev.data.size > 0) chunks.push(ev.data);
+		// Load primary file metadata via streamingDecoder so AudioProcessor
+		// can demux + re-encode the source audio into the same MP4 track.
+		const audioStreamingDecoder = new StreamingVideoDecoder();
+		let videoInfo: Awaited<ReturnType<StreamingVideoDecoder["loadMetadata"]>> | null = null;
+		try {
+			videoInfo = await audioStreamingDecoder.loadMetadata(primaryUrl);
+		} catch (e) {
+			console.warn("[multiLayerExporter] Could not parse primary for audio:", e);
+		}
+		const sourceDemuxer = audioStreamingDecoder.getDemuxer();
+		const audioExportCodec =
+			videoInfo?.hasAudio && sourceDemuxer
+				? await AudioProcessor.selectSupportedExportCodecForSource(sourceDemuxer)
+				: null;
+		const hasAudio = Boolean(audioExportCodec);
+
+		// Bitrate scales loosely with pixel-rate so 1080p60 lands around
+		// 12 Mbps and 720p30 around 4 Mbps. Bounded so 4K doesn't blow up.
+		const pixelRate = settings.width * settings.height * settings.fps;
+		const computedBitrate = Math.min(40_000_000, Math.max(2_000_000, Math.round(pixelRate * 0.1)));
+		const codec = "avc1.640033";
+		const exportConfig: ExportConfig = {
+			width: settings.width,
+			height: settings.height,
+			frameRate: settings.fps,
+			bitrate: computedBitrate,
+			codec,
 		};
 
-		const recorderStopped = new Promise<void>((resolve) => {
-			recorder.onstop = () => resolve();
+		const muxer = new VideoMuxer(exportConfig, hasAudio, audioExportCodec?.muxerCodec);
+		await muxer.initialize();
+
+		let videoDescription: Uint8Array | undefined;
+		let chunkCount = 0;
+		const muxingPromises: Promise<void>[] = [];
+		const encoderErrorRef: { current: Error | null } = { current: null };
+
+		const encoder = new VideoEncoder({
+			output: (chunk, meta) => {
+				if (meta?.decoderConfig?.description && !videoDescription) {
+					const desc = meta.decoderConfig.description;
+					if (desc instanceof ArrayBuffer || desc instanceof SharedArrayBuffer) {
+						videoDescription = new Uint8Array(desc);
+					} else if (ArrayBuffer.isView(desc)) {
+						videoDescription = new Uint8Array(desc.buffer, desc.byteOffset, desc.byteLength);
+					}
+				}
+				const isFirstChunk = chunkCount === 0;
+				chunkCount++;
+				const p = (async () => {
+					try {
+						if (isFirstChunk && videoDescription) {
+							const metadata: EncodedVideoChunkMetadata = {
+								decoderConfig: {
+									codec,
+									codedWidth: settings.width,
+									codedHeight: settings.height,
+									description: videoDescription,
+								},
+							};
+							await muxer.addVideoChunk(chunk, metadata);
+						} else {
+							await muxer.addVideoChunk(chunk, meta);
+						}
+					} catch (e) {
+						console.error("[multiLayerExporter] Muxing error:", e);
+					}
+				})();
+				muxingPromises.push(p);
+			},
+			error: (e) => {
+				encoderErrorRef.current = e instanceof Error ? e : new Error(String(e));
+				console.error("[multiLayerExporter] Encoder error:", e);
+			},
 		});
+
+		// Try hardware first; fall back to software if not supported.
+		let encoderConfig: VideoEncoderConfig = {
+			codec,
+			width: settings.width,
+			height: settings.height,
+			bitrate: computedBitrate,
+			framerate: settings.fps,
+			latencyMode: "quality",
+			bitrateMode: "variable",
+			hardwareAcceleration: "prefer-hardware",
+		};
+		let support = await VideoEncoder.isConfigSupported(encoderConfig);
+		if (!support.supported) {
+			encoderConfig = { ...encoderConfig, hardwareAcceleration: "no-preference" };
+			support = await VideoEncoder.isConfigSupported(encoderConfig);
+			if (!support.supported) {
+				cleanupAllLayers();
+				audioStreamingDecoder.cancel();
+				return { success: false, error: "Video encoder is not supported on this system." };
+			}
+		}
+		encoder.configure(encoderConfig);
 
 		// Start playback in lockstep. We seek every layer to 0 first so the
 		// first compositing frame is well-defined.
@@ -397,7 +498,10 @@ export async function exportMultiLayer(
 			),
 		);
 
-		recorder.start(1000);
+		// Primary's audio track flows through the source demuxer instead
+		// of the playback element, so mute the element to avoid the
+		// computer's speakers playing during a long export.
+		primaryVideo.muted = true;
 		await Promise.all(prepared.map((p) => p.video.play()));
 
 		const primaryDuration = isFinite(primaryVideo.duration) ? primaryVideo.duration : 0;
@@ -408,15 +512,24 @@ export async function exportMultiLayer(
 		};
 		signal?.addEventListener("abort", abortHandler);
 
-		const drawFrame = () => {
+		// Annotation strokes / fonts are stored at editor-preview scale.
+		// Scaling by canvas.height / 720 keeps them visually consistent
+		// at higher output resolutions (1080p / 1440p / 4K), matching
+		// the convention FrameRenderer uses for its single-layer path.
+		const annotationScaleFactor = canvas.height / 720;
+
+		const drawFrame = async () => {
+			const currentTimeMs = Math.round(primaryVideo.currentTime * 1000);
 			ctx.fillStyle = resolvedBackground.color;
 			ctx.fillRect(0, 0, canvas.width, canvas.height);
 			if (resolvedBackground.image) {
 				drawWallpaperImage(ctx, canvas.width, canvas.height, resolvedBackground.image);
 			}
 			if (useTransforms) {
-				const currentTimeMs = Math.round(primaryVideo.currentTime * 1000);
 				const transformedLayers: TransformedLayer[] = [];
+				// Primary layer anchors the composed timeline; every other
+				// layer's offset is its recorded start relative to primary.
+				const primaryRecordedAtMs = Number(media.layers[0]?.recordedAtMs ?? 0);
 				for (let i = 0; i < prepared.length; i++) {
 					const layerId = media.layers[i].id;
 					const t = transformByLayerId.get(layerId);
@@ -445,51 +558,143 @@ export async function exportMultiLayer(
 						resolved.position === base.position && resolved.size === base.size
 							? base
 							: { ...base, position: resolved.position, size: resolved.size };
-					transformedLayers.push({ video: prepared[i].video, transform: effective });
+
+					// Time-range gating + per-layer seek so mid-session dialogs
+					// appear at the same second where they originally opened.
+					// i === 0 is the primary anchor with offset 0 and no seek.
+					const video = prepared[i].video;
+					let inTimeRange = true;
+					if (i > 0) {
+						const layerRecordedAtMs = Number(media.layers[i].recordedAtMs ?? 0);
+						const offsetSec =
+							Number.isFinite(layerRecordedAtMs) && Number.isFinite(primaryRecordedAtMs)
+								? Math.max(0, (layerRecordedAtMs - primaryRecordedAtMs) / 1000)
+								: 0;
+						const layerDuration = Number.isFinite(video.duration) ? video.duration : Infinity;
+						const localTime = primaryVideo.currentTime - offsetSec;
+						if (localTime < 0 || localTime > layerDuration + 0.05) {
+							inTimeRange = false;
+							if (!video.paused) {
+								try {
+									video.pause();
+								} catch {
+									/* ignore */
+								}
+							}
+						} else {
+							if (video.paused) {
+								video.play().catch(() => undefined);
+							}
+							if (Math.abs(video.currentTime - localTime) > 0.25) {
+								try {
+									video.currentTime = localTime;
+								} catch {
+									/* ignore */
+								}
+							}
+						}
+					}
+
+					transformedLayers.push({ video, transform: effective, inTimeRange });
 				}
 				drawTransformedLayers(ctx, canvas.width, canvas.height, transformedLayers);
-				return;
-			}
-			// Legacy grid layout — preserved for callers that don't pass
-			// transforms yet.
-			for (let i = 0; i < prepared.length; i++) {
-				const cell = cells[i];
-				const v = prepared[i].video;
-				if (v.readyState < 2) continue;
-				const vw = v.videoWidth;
-				const vh = v.videoHeight;
-				if (vw === 0 || vh === 0) continue;
+			} else {
+				// Legacy grid layout — preserved for callers that don't pass
+				// transforms yet.
+				for (let i = 0; i < prepared.length; i++) {
+					const cell = cells[i];
+					const v = prepared[i].video;
+					if (v.readyState < 2) continue;
+					const vw = v.videoWidth;
+					const vh = v.videoHeight;
+					if (vw === 0 || vh === 0) continue;
 
-				// Fit (contain) inside the cell preserving aspect ratio.
-				const cellRatio = cell.w / cell.h;
-				const videoRatio = vw / vh;
-				let drawW: number;
-				let drawH: number;
-				if (videoRatio > cellRatio) {
-					drawW = cell.w;
-					drawH = Math.round(cell.w / videoRatio);
-				} else {
-					drawH = cell.h;
-					drawW = Math.round(cell.h * videoRatio);
+					// Fit (contain) inside the cell preserving aspect ratio.
+					const cellRatio = cell.w / cell.h;
+					const videoRatio = vw / vh;
+					let drawW: number;
+					let drawH: number;
+					if (videoRatio > cellRatio) {
+						drawW = cell.w;
+						drawH = Math.round(cell.w / videoRatio);
+					} else {
+						drawH = cell.h;
+						drawW = Math.round(cell.h * videoRatio);
+					}
+					const dx = cell.x + Math.round((cell.w - drawW) / 2);
+					const dy = cell.y + Math.round((cell.h - drawH) / 2);
+					try {
+						ctx.drawImage(v, dx, dy, drawW, drawH);
+					} catch {
+						// Frame may not be decodable yet — skip.
+					}
 				}
-				const dx = cell.x + Math.round((cell.w - drawW) / 2);
-				const dy = cell.y + Math.round((cell.h - drawH) / 2);
+			}
+
+			// Annotations / blur are drawn AFTER layers + wallpaper so
+			// blur correctly samples the composed pixels underneath.
+			if (annotationRegions && annotationRegions.length > 0) {
 				try {
-					ctx.drawImage(v, dx, dy, drawW, drawH);
+					await renderAnnotations(
+						ctx,
+						annotationRegions,
+						canvas.width,
+						canvas.height,
+						currentTimeMs,
+						annotationScaleFactor,
+					);
 				} catch {
-					// Frame may not be decodable yet — skip.
+					// Annotation render failures (e.g. unloadable image) must
+					// not abort the export — just skip and continue.
 				}
 			}
 		};
 
+		const frameDurationUs = 1_000_000 / settings.fps;
+		const maxEncodeQueue = 32;
+		let frameIndex = 0;
+
 		await new Promise<void>((resolve) => {
 			let lastReportSec = -1;
-			const tick = () => {
-				if (cancelled) {
+			let inFlight = false;
+			const tick = async () => {
+				if (cancelled || encoderErrorRef.current) {
 					resolve();
 					return;
 				}
-				drawFrame();
+				if (inFlight) {
+					requestAnimationFrame(tick);
+					return;
+				}
+				inFlight = true;
+				try {
+					await drawFrame();
+
+					// Backpressure: wait if the encoder queue is full.
+					while (
+						encoder.encodeQueueSize >= maxEncodeQueue &&
+						!cancelled &&
+						!encoderErrorRef.current
+					) {
+						await new Promise((r) => setTimeout(r, 5));
+					}
+
+					if (encoder.state === "configured" && !cancelled && !encoderErrorRef.current) {
+						const timestamp = Math.round(primaryVideo.currentTime * 1_000_000);
+						const videoFrame = new VideoFrame(canvas, {
+							timestamp,
+							duration: frameDurationUs,
+						});
+						try {
+							encoder.encode(videoFrame, { keyFrame: frameIndex % 150 === 0 });
+							frameIndex++;
+						} finally {
+							videoFrame.close();
+						}
+					}
+				} finally {
+					inFlight = false;
+				}
 				const now = primaryVideo.currentTime;
 				if (onProgress && Math.floor(now) !== lastReportSec) {
 					lastReportSec = Math.floor(now);
@@ -506,18 +711,47 @@ export async function exportMultiLayer(
 
 		signal?.removeEventListener("abort", abortHandler);
 
-		recorder.stop();
-		await recorderStopped;
-		for (const track of canvasStream.getTracks()) track.stop();
+		if (encoderErrorRef.current) {
+			cleanupAllLayers();
+			audioStreamingDecoder.cancel();
+			return { success: false, error: encoderErrorRef.current.message };
+		}
+
+		if (encoder.state === "configured") {
+			await encoder.flush();
+		}
+		await Promise.all(muxingPromises);
+
+		// Re-encode primary audio into the same MP4 muxer. Multi-layer
+		// export doesn't yet apply trim / speed regions, so audio plays
+		// through end-to-end at original rate.
+		if (hasAudio && audioExportCodec && sourceDemuxer && !cancelled) {
+			try {
+				const audioProcessor = new AudioProcessor();
+				await audioProcessor.process(
+					sourceDemuxer,
+					muxer,
+					primaryUrl,
+					undefined,
+					undefined,
+					primaryDuration || (videoInfo?.duration ?? 0),
+					audioExportCodec,
+				);
+			} catch (e) {
+				console.warn("[multiLayerExporter] Audio processing failed:", e);
+				// Continue with video-only output rather than aborting.
+			}
+		}
 
 		cleanupAllLayers();
+		audioStreamingDecoder.cancel();
 
 		if (cancelled) {
 			return { success: false, error: "Export cancelled." };
 		}
 
-		const blob = new Blob(chunks, { type: mime });
-		return { success: true, blob, mimeType: mime };
+		const blob = await muxer.finalize();
+		return { success: true, blob, mimeType: "video/mp4" };
 	} catch (error) {
 		cleanupAllLayers();
 		return {

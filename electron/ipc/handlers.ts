@@ -731,6 +731,501 @@ function isWindowsGraphicsCaptureOsSupported() {
 	return Number.isFinite(build) && build >= 19041;
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Process capture orchestrator (Windows).
+//
+// "Record every window of process X, including dialogs that pop up
+// mid-recording." Spawns one WGC helper per HWND at start, then polls the
+// window list every POLL_INTERVAL_MS so windows that appear later become
+// new layers automatically.
+//
+// Each sub-helper writes its own recording-<id>.mp4. `stopProcessCaptureGroup`
+// waits for all sub-helpers to close and returns the list of resulting
+// layer paths, which the renderer aggregates into ProjectMediaV3.layers.
+//
+// v1 constraints:
+// - Sub-helpers are video-only (no audio / webcam / cursor sidecar per
+//   layer — audio and cursor still ride on the primary recording path).
+// - Cursor / editable-overlay behaviour is skipped for process sub-helpers.
+// ─────────────────────────────────────────────────────────────────────────
+
+interface EnumeratedWindow {
+	hwnd: number;
+	sourceId: string;
+	pid: number;
+	processName: string;
+	processPath: string;
+	title: string;
+	className: string;
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+}
+
+type EnumerateResult = { windows: EnumeratedWindow[] } | { error: string };
+
+async function enumerateVisibleWindows(): Promise<EnumerateResult> {
+	if (process.platform !== "win32") {
+		return { windows: [] };
+	}
+	const helperPath = await findNativeWindowsCaptureHelperPath();
+	if (!helperPath) {
+		return { error: "wgc-capture helper not found" };
+	}
+	return await new Promise<EnumerateResult>((resolve) => {
+		const child = spawn(helperPath, ["--list-windows"], {
+			stdio: ["ignore", "pipe", "pipe"],
+			windowsHide: true,
+		});
+		let out = "";
+		let err = "";
+		child.stdout.on("data", (chunk: Buffer) => {
+			out += chunk.toString("utf8");
+		});
+		child.stderr.on("data", (chunk: Buffer) => {
+			err += chunk.toString("utf8");
+		});
+		child.on("error", (spawnError) => {
+			resolve({ error: `helper spawn failed: ${String(spawnError)}` });
+		});
+		child.on("close", (code) => {
+			if (code !== 0) {
+				resolve({ error: `helper exited with code ${code}: ${err.trim()}` });
+				return;
+			}
+			try {
+				const parsed = JSON.parse(out.trim()) as { windows?: EnumeratedWindow[] };
+				resolve({ windows: parsed.windows ?? [] });
+			} catch (parseError) {
+				resolve({ error: `failed to parse helper output: ${String(parseError)}` });
+			}
+		});
+	});
+}
+
+interface StartProcessCaptureRequest {
+	sessionId: string;
+	baseRecordingId: number;
+	pid: number;
+	processName: string;
+	fps?: number;
+	videoWidth?: number;
+	videoHeight?: number;
+	/** When true, WGC bakes the OS cursor into each sub-helper's mp4.
+	 *  Set by the renderer from `cursorCaptureMode === "system"`. */
+	captureCursor?: boolean;
+}
+
+interface ProcessSubHelper {
+	hwnd: number;
+	recordingId: number;
+	layerId: string;
+	process: ChildProcessWithoutNullStreams;
+	screenVideoPath: string;
+	sourceLabel: string;
+	sourceWidth: number;
+	sourceHeight: number;
+	recordedAtMs: number;
+	isPaused: boolean;
+	hasStopped: boolean;
+	stdoutBuf: string;
+	stderrBuf: string;
+	exited: Promise<{ code: number | null; error?: string }>;
+	resolveReady?: () => void;
+	readyPromise: Promise<void>;
+}
+
+interface ProcessCaptureGroup {
+	groupId: string;
+	pid: number;
+	processName: string;
+	sessionId: string;
+	baseRecordingId: number;
+	nextRecordingOffset: number;
+	fps: number;
+	videoWidth: number;
+	videoHeight: number;
+	helperPath: string;
+	captureCursor: boolean;
+	subHelpers: Map<number /* hwnd */, ProcessSubHelper>;
+	pollTimer: NodeJS.Timeout | null;
+	isPaused: boolean;
+	isStopped: boolean;
+}
+
+const processCaptureGroups = new Map<string, ProcessCaptureGroup>();
+const PROCESS_CAPTURE_POLL_MS = 750;
+
+function newProcessGroupId(): string {
+	return `pcap-${Date.now().toString(36)}-${Math.floor(Math.random() * 1000).toString(36)}`;
+}
+
+function newLayerIdForProcess(): string {
+	return `layer-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+// Spawn a single WGC helper for one HWND. Non-fatal on failure (returns
+// null); the caller logs and moves on. Adds the helper to the group's
+// subHelpers map on success.
+async function spawnProcessSubHelper(
+	group: ProcessCaptureGroup,
+	window: EnumeratedWindow,
+): Promise<ProcessSubHelper | null> {
+	const recordingId = group.baseRecordingId + group.nextRecordingOffset;
+	group.nextRecordingOffset += 1;
+	const outputPath = path.join(RECORDINGS_DIR, `${RECORDING_FILE_PREFIX}${recordingId}.mp4`);
+	const config = {
+		schemaVersion: 2,
+		recordingId,
+		outputPath,
+		screenPath: outputPath,
+		sourceType: "window",
+		sourceId: window.sourceId,
+		windowHandle: String(window.hwnd),
+		displayId: 0,
+		fps: group.fps,
+		videoWidth: group.videoWidth,
+		videoHeight: group.videoHeight,
+		hasDisplayBounds: false,
+		captureSystemAudio: false,
+		captureMic: false,
+		captureCursor: group.captureCursor,
+		webcamEnabled: false,
+		armedStart: false,
+	};
+	let proc: ChildProcessWithoutNullStreams;
+	try {
+		proc = spawn(group.helperPath, [JSON.stringify(config)], {
+			cwd: RECORDINGS_DIR,
+			stdio: ["pipe", "pipe", "pipe"],
+			windowsHide: true,
+		});
+	} catch (spawnErr) {
+		console.warn(`[pcap] failed to spawn helper for hwnd=${window.hwnd}:`, spawnErr);
+		return null;
+	}
+
+	let resolveReady: (() => void) | undefined;
+	const readyPromise = new Promise<void>((resolve) => {
+		resolveReady = resolve;
+	});
+
+	const sub: ProcessSubHelper = {
+		hwnd: window.hwnd,
+		recordingId,
+		layerId: newLayerIdForProcess(),
+		process: proc,
+		screenVideoPath: outputPath,
+		sourceLabel: window.title || window.processName || `window ${window.hwnd}`,
+		sourceWidth: window.width,
+		sourceHeight: window.height,
+		recordedAtMs: Date.now(),
+		isPaused: false,
+		hasStopped: false,
+		stdoutBuf: "",
+		stderrBuf: "",
+		exited: new Promise((resolve) => {
+			proc.on("close", (code) => resolve({ code }));
+			proc.on("error", (err) => resolve({ code: null, error: String(err) }));
+		}),
+		resolveReady,
+		readyPromise,
+	};
+
+	proc.stdout.on("data", (chunk: Buffer) => {
+		const text = chunk.toString("utf8");
+		sub.stdoutBuf += text;
+		// Line-buffer log so we can tell which sub-helper said what without
+		// having to reconstruct multi-chunk boundaries.
+		for (const line of text.split(/\r?\n/)) {
+			const trimmed = line.trim();
+			if (trimmed) console.info(`[pcap sub ${recordingId} hwnd=${window.hwnd}] ${trimmed}`);
+		}
+		if (sub.resolveReady && sub.stdoutBuf.includes("recording-started")) {
+			sub.resolveReady();
+			sub.resolveReady = undefined;
+		}
+	});
+	proc.stderr.on("data", (chunk: Buffer) => {
+		const text = chunk.toString("utf8");
+		sub.stderrBuf += text;
+		for (const line of text.split(/\r?\n/)) {
+			const trimmed = line.trim();
+			if (trimmed) console.warn(`[pcap sub ${recordingId} hwnd=${window.hwnd} STDERR] ${trimmed}`);
+		}
+	});
+	// Guarantee readyPromise settles even if the helper dies before emitting
+	// recording-started — otherwise stopProcessCaptureGroup could hang.
+	sub.exited.then(() => {
+		sub.hasStopped = true;
+		if (sub.resolveReady) {
+			sub.resolveReady();
+			sub.resolveReady = undefined;
+		}
+	});
+
+	// Apply pause state if the group is already paused when the new window
+	// appears mid-recording. Keeps the invariant "if group paused, all
+	// sub-helpers paused" holding.
+	if (group.isPaused && !proc.stdin.destroyed) {
+		try {
+			proc.stdin.write("pause\n");
+			sub.isPaused = true;
+		} catch {
+			// Ignore write failures — the sub will exit and be pruned.
+		}
+	}
+
+	group.subHelpers.set(window.hwnd, sub);
+	console.info(
+		`[pcap] spawned helper hwnd=${window.hwnd} recordingId=${recordingId} title="${sub.sourceLabel}"`,
+	);
+	return sub;
+}
+
+async function pollForNewWindows(group: ProcessCaptureGroup): Promise<void> {
+	if (group.isStopped) return;
+	const enumResult = await enumerateVisibleWindows();
+	if (group.isStopped) return;
+	if ("error" in enumResult) {
+		// Enumeration failed once; skip this tick.
+		return;
+	}
+	for (const w of enumResult.windows) {
+		if (w.pid !== group.pid) continue;
+		if (group.subHelpers.has(w.hwnd)) continue;
+		// Also skip helpers that already exited (window closed mid-recording
+		// but same HWND reused would be pathological — extremely unlikely).
+		await spawnProcessSubHelper(group, w).catch((err) =>
+			console.warn(`[pcap] spawn failed for hwnd=${w.hwnd}:`, err),
+		);
+	}
+}
+
+async function startProcessCaptureGroup(req: StartProcessCaptureRequest): Promise<
+	| {
+			success: true;
+			groupId: string;
+			layers: Array<{
+				layerId: string;
+				recordingId: number;
+				screenVideoPath: string;
+				sourceLabel: string;
+				sourceWidth: number;
+				sourceHeight: number;
+				recordedAtMs: number;
+			}>;
+	  }
+	| { success: false; error: string }
+> {
+	if (process.platform !== "win32") {
+		return { success: false, error: "Process capture is only supported on Windows." };
+	}
+	if (!isWindowsGraphicsCaptureOsSupported()) {
+		return {
+			success: false,
+			error: "Windows Graphics Capture requires Windows 10 build 19041 or newer.",
+		};
+	}
+	const helperPath = await findNativeWindowsCaptureHelperPath();
+	if (!helperPath) {
+		return { success: false, error: "Native Windows capture helper not found." };
+	}
+	if (!Number.isFinite(req.pid) || req.pid <= 0) {
+		return { success: false, error: "Invalid pid." };
+	}
+	await fs.mkdir(RECORDINGS_DIR, { recursive: true });
+
+	const initial = await enumerateVisibleWindows();
+	if ("error" in initial) {
+		return { success: false, error: `Failed to enumerate windows: ${initial.error}` };
+	}
+	const initialWindows = initial.windows.filter((w) => w.pid === req.pid);
+	if (initialWindows.length === 0) {
+		return {
+			success: false,
+			error: `No visible windows found for pid ${req.pid} (${req.processName}).`,
+		};
+	}
+
+	const group: ProcessCaptureGroup = {
+		groupId: newProcessGroupId(),
+		pid: req.pid,
+		processName: req.processName,
+		sessionId: req.sessionId,
+		baseRecordingId: req.baseRecordingId,
+		nextRecordingOffset: 0,
+		fps: req.fps && req.fps > 0 ? req.fps : 60,
+		videoWidth: req.videoWidth ?? 0,
+		videoHeight: req.videoHeight ?? 0,
+		helperPath,
+		captureCursor: Boolean(req.captureCursor),
+		subHelpers: new Map(),
+		pollTimer: null,
+		isPaused: false,
+		isStopped: false,
+	};
+	processCaptureGroups.set(group.groupId, group);
+
+	// Spawn all initial helpers in parallel, then wait for their WGC/MF
+	// warmup to complete so the caller receives a group that's actually
+	// recording (not just spawned). Uses Promise.allSettled so a single
+	// helper failure doesn't block the whole group.
+	const initialSubs: ProcessSubHelper[] = [];
+	for (const w of initialWindows) {
+		const sub = await spawnProcessSubHelper(group, w);
+		if (sub) initialSubs.push(sub);
+	}
+	await Promise.allSettled(initialSubs.map((s) => s.readyPromise));
+
+	if (group.subHelpers.size === 0) {
+		processCaptureGroups.delete(group.groupId);
+		return {
+			success: false,
+			error: `Failed to spawn any window capture helper for pid ${req.pid}.`,
+		};
+	}
+
+	// Kick off the mid-recording watcher. Uses setInterval — the tick
+	// callback is guarded against overlapping runs via `pollInFlight`.
+	let pollInFlight = false;
+	group.pollTimer = setInterval(() => {
+		if (pollInFlight) return;
+		pollInFlight = true;
+		pollForNewWindows(group)
+			.catch((err) => console.warn(`[pcap] poll error group=${group.groupId}:`, err))
+			.finally(() => {
+				pollInFlight = false;
+			});
+	}, PROCESS_CAPTURE_POLL_MS);
+
+	// Approve output paths so the renderer can read them for editor preview.
+	for (const sub of group.subHelpers.values()) {
+		approveFilePath(sub.screenVideoPath);
+	}
+
+	return {
+		success: true,
+		groupId: group.groupId,
+		layers: Array.from(group.subHelpers.values()).map((sub) => ({
+			layerId: sub.layerId,
+			recordingId: sub.recordingId,
+			screenVideoPath: sub.screenVideoPath,
+			sourceLabel: sub.sourceLabel,
+			sourceWidth: sub.sourceWidth,
+			sourceHeight: sub.sourceHeight,
+			recordedAtMs: sub.recordedAtMs,
+		})),
+	};
+}
+
+async function pauseProcessCaptureGroup(groupId: string): Promise<void> {
+	const group = processCaptureGroups.get(groupId);
+	if (!group) throw new Error(`Unknown process capture group: ${groupId}`);
+	if (group.isPaused) return;
+	group.isPaused = true;
+	for (const sub of group.subHelpers.values()) {
+		if (sub.hasStopped || sub.process.stdin.destroyed) continue;
+		try {
+			sub.process.stdin.write("pause\n");
+			sub.isPaused = true;
+		} catch {
+			// Ignore — helper likely exited.
+		}
+	}
+}
+
+async function resumeProcessCaptureGroup(groupId: string): Promise<void> {
+	const group = processCaptureGroups.get(groupId);
+	if (!group) throw new Error(`Unknown process capture group: ${groupId}`);
+	if (!group.isPaused) return;
+	group.isPaused = false;
+	for (const sub of group.subHelpers.values()) {
+		if (sub.hasStopped || sub.process.stdin.destroyed) continue;
+		try {
+			sub.process.stdin.write("resume\n");
+			sub.isPaused = false;
+		} catch {
+			// Ignore.
+		}
+	}
+}
+
+async function stopProcessCaptureGroup(
+	groupId: string,
+	opts?: { discard?: boolean },
+): Promise<{
+	success: true;
+	layers: Array<{
+		layerId: string;
+		recordingId: number;
+		screenVideoPath: string;
+		sourceLabel: string;
+		sourceWidth: number;
+		sourceHeight: number;
+		recordedAtMs: number;
+	}>;
+}> {
+	const group = processCaptureGroups.get(groupId);
+	if (!group) throw new Error(`Unknown process capture group: ${groupId}`);
+	group.isStopped = true;
+	if (group.pollTimer) {
+		clearInterval(group.pollTimer);
+		group.pollTimer = null;
+	}
+	// Send stop to every alive sub. Helpers that already died just resolve
+	// their `exited` promise immediately.
+	for (const sub of group.subHelpers.values()) {
+		if (sub.hasStopped || sub.process.stdin.destroyed) continue;
+		try {
+			sub.process.stdin.write("stop\n");
+			sub.process.stdin.end();
+		} catch {
+			// Ignore — child may already be gone.
+		}
+	}
+	// Wait for all helpers to close. Cap the wait so a misbehaving helper
+	// doesn't hang stop indefinitely — after 15s we hard-kill survivors.
+	const HARD_KILL_MS = 15_000;
+	await Promise.race([
+		Promise.all(Array.from(group.subHelpers.values()).map((s) => s.exited)),
+		new Promise((r) => setTimeout(r, HARD_KILL_MS)),
+	]);
+	for (const sub of group.subHelpers.values()) {
+		if (!sub.hasStopped) {
+			try {
+				sub.process.kill();
+			} catch {
+				// Ignore.
+			}
+		}
+	}
+
+	processCaptureGroups.delete(groupId);
+
+	if (opts?.discard) {
+		// Best-effort delete of outputs on discard.
+		for (const sub of group.subHelpers.values()) {
+			await fs.unlink(sub.screenVideoPath).catch(() => undefined);
+		}
+		return { success: true, layers: [] };
+	}
+
+	return {
+		success: true,
+		layers: Array.from(group.subHelpers.values()).map((sub) => ({
+			layerId: sub.layerId,
+			recordingId: sub.recordingId,
+			screenVideoPath: sub.screenVideoPath,
+			sourceLabel: sub.sourceLabel,
+			sourceWidth: sub.sourceWidth,
+			sourceHeight: sub.sourceHeight,
+			recordedAtMs: sub.recordedAtMs,
+		})),
+	};
+}
+
 function normalizeNativeDeviceName(value: string) {
 	return value
 		.toLowerCase()
@@ -1494,6 +1989,52 @@ export function registerIpcHandlers(
 	ipcMain.handle("get-selected-sources", () => {
 		return selectedSources;
 	});
+
+	// Windows only: enumerate every visible top-level window together with its
+	// owning process. Feeds the source picker's "record every window of X"
+	// affordance. Falls back to an empty list on non-Windows or when the
+	// helper binary can't be located — the renderer degrades gracefully.
+	ipcMain.handle("enumerate-windows-by-process", async () => {
+		return await enumerateVisibleWindows();
+	});
+
+	// Process capture: start / pause / resume / stop for a "record every
+	// window of process X" session. The orchestrator spawns one WGC helper
+	// per HWND at start, then polls periodically so windows that appear
+	// mid-recording (e.g. a dialog opening) become new layers automatically.
+	ipcMain.handle("start-process-window-capture", async (_, req: StartProcessCaptureRequest) => {
+		try {
+			return await startProcessCaptureGroup(req);
+		} catch (error) {
+			return { success: false, error: String(error) };
+		}
+	});
+	ipcMain.handle("pause-process-window-capture", async (_, groupId: string) => {
+		try {
+			await pauseProcessCaptureGroup(groupId);
+			return { success: true };
+		} catch (error) {
+			return { success: false, error: String(error) };
+		}
+	});
+	ipcMain.handle("resume-process-window-capture", async (_, groupId: string) => {
+		try {
+			await resumeProcessCaptureGroup(groupId);
+			return { success: true };
+		} catch (error) {
+			return { success: false, error: String(error) };
+		}
+	});
+	ipcMain.handle(
+		"stop-process-window-capture",
+		async (_, groupId: string, opts?: { discard?: boolean }) => {
+			try {
+				return await stopProcessCaptureGroup(groupId, opts);
+			} catch (error) {
+				return { success: false, error: String(error) };
+			}
+		},
+	);
 
 	ipcMain.handle("write-multi-source-session-manifest", async (_, mediaInput: unknown) => {
 		const media = toProjectMediaV3(mediaInput);

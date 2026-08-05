@@ -38,6 +38,7 @@ import type {
 } from "../types";
 import Item from "./Item";
 import KeyframeMarkers from "./KeyframeMarkers";
+import LayerLifespanBar from "./LayerLifespanBar";
 import Row from "./Row";
 import TimelineWrapper from "./TimelineWrapper";
 import { detectZoomDwellCandidates, normalizeCursorTelemetry } from "./zoomSuggestionUtils";
@@ -90,6 +91,11 @@ interface TimelineEditorProps {
 	selectedSpeedId?: string | null;
 	onSelectSpeed?: (id: string | null) => void;
 	layers?: Array<{ id: string; label: string }>;
+	/** Per-additional-layer lifespan info. Matches `layers[1..]` positionally
+	 *  (index 0 in this array = layers[1], because the primary layer covers
+	 *  the whole timeline and doesn't need a bar). Undefined ⇒ no lifespan
+	 *  track drawn, preserving the pre-multi-window behaviour. */
+	layerLifespans?: Array<{ layerId: string; startMs: number; endMs: number }>;
 	moveRegions?: MoveRegion[];
 	onMoveAdded?: (layerId: string, span: Span) => void;
 	onMoveSpanChange?: (id: string, span: Span) => void;
@@ -580,6 +586,7 @@ function Timeline({
 	selectedMoveId,
 	keyframes = [],
 	layers = [],
+	layerLifespans,
 }: {
 	items: TimelineRenderItem[];
 	videoDurationMs: number;
@@ -600,6 +607,7 @@ function Timeline({
 	selectedMoveId?: string | null;
 	keyframes?: { id: string; time: number }[];
 	layers?: Array<{ id: string; label: string }>;
+	layerLifespans?: Array<{ layerId: string; startMs: number; endMs: number }>;
 }) {
 	const t = useScopedT("timeline");
 	const { setTimelineRef, style, sidebarWidth, range, pixelsToValue } = useTimelineContext();
@@ -887,13 +895,22 @@ function Timeline({
 			{layers.map((layer) => {
 				const rowId = `${MOVE_ROW_ID_PREFIX}${layer.id}`;
 				const rowItems = moveItemsByLayer.get(layer.id) ?? [];
+				const lifespan = layerLifespans?.find((l) => l.layerId === layer.id);
 				return (
 					<Row
 						key={rowId}
 						id={rowId}
-						isEmpty={rowItems.length === 0}
+						isEmpty={rowItems.length === 0 && !lifespan}
 						hint={`${layer.label} — add a move`}
 					>
+						{lifespan && lifespan.endMs > lifespan.startMs && (
+							<LayerLifespanBar
+								id={`lifespan-${layer.id}`}
+								rowId={rowId}
+								span={{ start: lifespan.startMs, end: lifespan.endMs }}
+								label={`${layer.label} lifespan`}
+							/>
+						)}
 						{rowItems.map((item) => (
 							<Item
 								id={item.id}
@@ -952,6 +969,7 @@ export default function TimelineEditor({
 	selectedSpeedId,
 	onSelectSpeed,
 	layers = [],
+	layerLifespans,
 	moveRegions = [],
 	onMoveAdded,
 	onMoveSpanChange,
@@ -1849,6 +1867,7 @@ export default function TimelineEditor({
 						selectedMoveId={selectedMoveId}
 						keyframes={keyframes}
 						layers={layers}
+						layerLifespans={layerLifespans}
 					/>
 				</TimelineWrapper>
 			</div>

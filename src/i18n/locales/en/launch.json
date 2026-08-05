@@ -32,7 +32,10 @@
 		"loading": "Loading sources...",
 		"screens": "Screens ({{count}})",
 		"windows": "Windows ({{count}})",
-		"defaultSourceName": "Screen"
+		"processes": "Processes ({{count}})",
+		"processWindowCount": "{{count}} window(s)",
+		"defaultSourceName": "Screen",
+		"selectionHint": "{{count}} sources selected — they will be recorded in parallel."
 	},
 	"recording": {
 		"selectSource": "Please select a source to record"

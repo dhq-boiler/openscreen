@@ -207,6 +207,22 @@ export default function VideoEditor() {
 	// Phase 4.5: layer ids matched 1:1 with additionalLayerPaths. Required so
 	// MultiLayerOverlay can resolve which LayerTransform belongs to each tile.
 	const [additionalLayerIds, setAdditionalLayerIds] = useState<string[]>([]);
+	// Per-additional-layer offset from the session start (ms). Set from
+	// `recordedAtMs` on load so a dialog recorded mid-session appears at the
+	// same point in the composed timeline where it originally opened. Zero
+	// when the manifest doesn't carry recordedAtMs (legacy multi-source
+	// projects) so the pre-offset behaviour is preserved.
+	const [additionalLayerOffsetsMs, setAdditionalLayerOffsetsMs] = useState<number[]>([]);
+	// Raw wall-clock `recordedAtMs` values from the loaded manifest. Kept
+	// separately from `additionalLayerOffsetsMs` (which is derived) so
+	// save → load round-trips preserve the exact timing anchors; without
+	// this the offsets collapse to 0 on the next open.
+	const [primaryRecordedAtMs, setPrimaryRecordedAtMs] = useState<number | null>(null);
+	const [additionalLayerRecordedAtMs, setAdditionalLayerRecordedAtMs] = useState<number[]>([]);
+	// Metadata-only fetched durations for each additional layer, in ms.
+	// Populated asynchronously after paths change; the timeline lifespan
+	// bars stay hidden until the corresponding entry becomes finite.
+	const [additionalLayerDurationsMs, setAdditionalLayerDurationsMs] = useState<number[]>([]);
 	// Phase 5 UI: full layer roster (primary + additional) used by the zoom
 	// settings panel to let the user choose which layer a ZoomRegion targets.
 	// Empty for v2 projects; populated only when a v3 multi-layer media loads.
@@ -319,6 +335,51 @@ export default function VideoEditor() {
 	// for single-source projects (the multi-layer SettingsPanel is hidden in
 	// that case); the timeline still wants one row per layer, so we synthesize
 	// a single-layer entry from layerTransforms as a fallback.
+	// Probe each additional layer's duration via a throwaway <video> so the
+	// timeline can draw its lifespan bar without needing the playback video
+	// element to have mounted first (and without lifting MultiLayerOverlay
+	// state up through several component levels).
+	useEffect(() => {
+		let cancelled = false;
+		if (additionalLayerPaths.length === 0) {
+			setAdditionalLayerDurationsMs([]);
+			return;
+		}
+		const durations: number[] = new Array(additionalLayerPaths.length).fill(0);
+		const probes = additionalLayerPaths.map(
+			(url, idx) =>
+				new Promise<void>((resolve) => {
+					const el = document.createElement("video");
+					el.preload = "metadata";
+					const settle = () => {
+						if (Number.isFinite(el.duration) && el.duration > 0) {
+							durations[idx] = el.duration * 1000;
+						}
+						el.removeAttribute("src");
+						el.load();
+						resolve();
+					};
+					el.addEventListener("loadedmetadata", settle, { once: true });
+					el.addEventListener("error", settle, { once: true });
+					el.src = url;
+				}),
+		);
+		Promise.all(probes).then(() => {
+			if (!cancelled) setAdditionalLayerDurationsMs(durations);
+		});
+		return () => {
+			cancelled = true;
+		};
+	}, [additionalLayerPaths]);
+
+	const layerLifespans = useMemo(() => {
+		return additionalLayerIds.map((layerId, idx) => {
+			const startMs = additionalLayerOffsetsMs[idx] ?? 0;
+			const durMs = additionalLayerDurationsMs[idx] ?? 0;
+			return { layerId, startMs, endMs: startMs + durMs };
+		});
+	}, [additionalLayerIds, additionalLayerOffsetsMs, additionalLayerDurationsMs]);
+
 	const timelineLayers = useMemo(() => {
 		if (availableLayers.length > 0) {
 			return availableLayers.map((layer, idx) => ({
@@ -376,12 +437,22 @@ export default function VideoEditor() {
 				id: primaryLayerId,
 				kind: "screen",
 				screenVideoPath,
+				// Preserve the primary anchor so additional layers can be
+				// placed relative to it on the next open. Fall back to 0
+				// (the earliest possible timestamp) for legacy projects.
+				...(primaryRecordedAtMs !== null && Number.isFinite(primaryRecordedAtMs)
+					? { recordedAtMs: primaryRecordedAtMs }
+					: {}),
 			},
-			...additionalLayerPaths.map((url, idx) => ({
-				id: additionalLayerIds[idx] ?? `layer-${Math.random().toString(36).slice(2, 10)}`,
-				kind: "screen" as const,
-				screenVideoPath: fromFileUrl(url),
-			})),
+			...additionalLayerPaths.map((url, idx) => {
+				const rec = additionalLayerRecordedAtMs[idx];
+				return {
+					id: additionalLayerIds[idx] ?? `layer-${Math.random().toString(36).slice(2, 10)}`,
+					kind: "screen" as const,
+					screenVideoPath: fromFileUrl(url),
+					...(Number.isFinite(rec) && rec > 0 ? { recordedAtMs: rec } : {}),
+				};
+			}),
 		];
 
 		const fallbackSessionId = `session-${Date.now().toString(36)}-${Math.random()
@@ -403,6 +474,8 @@ export default function VideoEditor() {
 		recordingCursorCaptureMode,
 		additionalLayerPaths,
 		additionalLayerIds,
+		additionalLayerRecordedAtMs,
+		primaryRecordedAtMs,
 		availableLayers,
 		projectSessionId,
 	]);
@@ -451,6 +524,22 @@ export default function VideoEditor() {
 				projectMediaV3 && projectMediaV3.layers.length > 1
 					? projectMediaV3.layers.slice(1).map((layer) => layer.id)
 					: [];
+			// The primary layer (index 0) is the timeline anchor; every
+			// other layer's offsetMs is its wall-clock start minus the
+			// primary's. Missing recordedAtMs values collapse to zero, which
+			// keeps legacy projects behaving exactly like before.
+			const primaryRecordedAtMs =
+				projectMediaV3 && projectMediaV3.layers.length > 0
+					? Number(projectMediaV3.layers[0].recordedAtMs ?? 0)
+					: 0;
+			const extraLayerOffsetsMs =
+				projectMediaV3 && projectMediaV3.layers.length > 1
+					? projectMediaV3.layers.slice(1).map((layer) => {
+							const layerAt = Number(layer.recordedAtMs ?? 0);
+							if (!Number.isFinite(layerAt) || !Number.isFinite(primaryRecordedAtMs)) return 0;
+							return Math.max(0, layerAt - primaryRecordedAtMs);
+						})
+					: [];
 			// Phase 5 UI: build the layer roster so SettingsPanel can offer
 			// "Apply zoom to: Stage / Layer 1 / Layer 2 / ...". Single-source
 			// projects keep an empty roster and the picker stays hidden.
@@ -464,6 +553,17 @@ export default function VideoEditor() {
 					: [];
 			setAdditionalLayerPaths(extraLayerPaths);
 			setAdditionalLayerIds(extraLayerIds);
+			setAdditionalLayerOffsetsMs(extraLayerOffsetsMs);
+			setPrimaryRecordedAtMs(
+				projectMediaV3 && projectMediaV3.layers.length > 0
+					? Number(projectMediaV3.layers[0].recordedAtMs ?? 0)
+					: null,
+			);
+			setAdditionalLayerRecordedAtMs(
+				projectMediaV3 && projectMediaV3.layers.length > 1
+					? projectMediaV3.layers.slice(1).map((layer) => Number(layer.recordedAtMs ?? 0))
+					: [],
+			);
 			setAvailableLayers(layerRoster);
 			setProjectSessionId(projectMediaV3?.sessionId ?? null);
 			const normalizedEditor = normalizeProjectEditor(project.editor);
@@ -1143,6 +1243,71 @@ export default function VideoEditor() {
 			}));
 		},
 		[updateState],
+	);
+
+	// Reorder a layer's zOrder relative to peers. All four operations
+	// commit as a single history checkpoint. "back"/"front" reserve a
+	// zOrder outside the existing range so ties do not need reshuffling;
+	// "backward"/"forward" swap with the neighbour on that side.
+	const handleLayerReorder = useCallback(
+		(layerId: string, direction: "back" | "backward" | "forward" | "front") => {
+			pushState((prev) => {
+				const list = prev.layerTransforms;
+				if (list.length === 0) return {};
+				const target = list.find((t) => t.layerId === layerId);
+				if (!target) return {};
+				const minZ = list.reduce((m, t) => Math.min(m, t.zOrder), Number.POSITIVE_INFINITY);
+				const maxZ = list.reduce((m, t) => Math.max(m, t.zOrder), Number.NEGATIVE_INFINITY);
+
+				if (direction === "back") {
+					const newZ = minZ - 1;
+					return {
+						layerTransforms: list.map((t) => (t.layerId === layerId ? { ...t, zOrder: newZ } : t)),
+					};
+				}
+				if (direction === "front") {
+					const newZ = maxZ + 1;
+					return {
+						layerTransforms: list.map((t) => (t.layerId === layerId ? { ...t, zOrder: newZ } : t)),
+					};
+				}
+				if (direction === "backward") {
+					// Neighbour with the largest zOrder strictly less than target's.
+					let below: LayerTransform | null = null;
+					for (const t of list) {
+						if (t.layerId === layerId) continue;
+						if (t.zOrder < target.zOrder) {
+							if (!below || t.zOrder > below.zOrder) below = t;
+						}
+					}
+					if (!below) return {};
+					return {
+						layerTransforms: list.map((t) => {
+							if (t.layerId === layerId) return { ...t, zOrder: below.zOrder };
+							if (below && t.layerId === below.layerId) return { ...t, zOrder: target.zOrder };
+							return t;
+						}),
+					};
+				}
+				// forward: neighbour with the smallest zOrder strictly greater.
+				let above: LayerTransform | null = null;
+				for (const t of list) {
+					if (t.layerId === layerId) continue;
+					if (t.zOrder > target.zOrder) {
+						if (!above || t.zOrder < above.zOrder) above = t;
+					}
+				}
+				if (!above) return {};
+				return {
+					layerTransforms: list.map((t) => {
+						if (t.layerId === layerId) return { ...t, zOrder: above.zOrder };
+						if (above && t.layerId === above.layerId) return { ...t, zOrder: target.zOrder };
+						return t;
+					}),
+				};
+			});
+		},
+		[pushState],
 	);
 
 	// Focus drag: updateState for live preview, commitState on pointer-up
@@ -1927,16 +2092,18 @@ export default function VideoEditor() {
 				return;
 			}
 
-			// Phase 3 known limitation: the export pipeline composes one
-			// VideoFrame at a time, so additional v3 layers are not yet
-			// baked into the output. Warn the user up front rather than
-			// silently dropping them.
+			// Known limitation of the multi-layer export pipeline: zoom
+			// regions and cursor highlights are not yet applied. Layers,
+			// wallpaper, MoveRegions, and annotations / blur ARE applied.
 			if (additionalLayerPaths.length > 0) {
-				toast.warning(
-					`Exporting primary layer only — ${additionalLayerPaths.length} additional layer${
-						additionalLayerPaths.length === 1 ? " is" : "s are"
-					} visible in the editor but not yet composed into the exported video (Phase 3.5 follow-up).`,
-				);
+				const skipped: string[] = [];
+				if (zoomRegions.length > 0) skipped.push("zoom regions");
+				if (effectiveShowCursor) skipped.push("cursor highlight");
+				if (skipped.length > 0) {
+					toast.warning(
+						`Multi-layer export skips ${skipped.join(" and ")} — those effects are not yet composed into the output.`,
+					);
+				}
 			}
 
 			// Ask the user where to save BEFORE starting the export. This avoids the
@@ -2106,6 +2273,7 @@ export default function VideoEditor() {
 							layerTransforms,
 							moveRegions,
 							wallpaper,
+							annotationRegions,
 							settings: {
 								width: exportWidth,
 								height: exportHeight,
@@ -2532,10 +2700,12 @@ export default function VideoEditor() {
 												videoPath={videoPath || ""}
 												additionalLayerPaths={additionalLayerPaths}
 												additionalLayerIds={additionalLayerIds}
+												additionalLayerOffsetsMs={additionalLayerOffsetsMs}
 												primaryLayerId={availableLayers[0]?.id ?? null}
 												layerTransforms={layerTransforms}
 												onLayerTransformUpdate={handleLayerTransformUpdate}
 												onLayerTransformCommit={commitState}
+												onLayerReorder={handleLayerReorder}
 												moveRegions={moveRegions}
 												selectedMoveId={selectedMoveId}
 												onMoveFromChange={handleMoveFromChange}
@@ -2843,6 +3013,7 @@ export default function VideoEditor() {
 								selectedBlurId={selectedBlurId}
 								onSelectBlur={handleSelectBlur}
 								layers={timelineLayers}
+								layerLifespans={layerLifespans}
 								moveRegions={moveRegions}
 								onMoveAdded={handleMoveAdded}
 								onMoveSpanChange={handleMoveSpanChange}

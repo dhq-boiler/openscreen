@@ -17,6 +17,11 @@
 class WgcSession {
 public:
     using FrameCallback = std::function<void(ID3D11Texture2D*, int64_t)>;
+    // Fires exactly once when GraphicsCaptureItem.Closed lands — WGC's signal
+    // that the source is gone (window destroyed, monitor unplugged). Consumers
+    // use it to stop capture gracefully instead of racing FrameArrived against
+    // the disappearing source.
+    using ClosedCallback = std::function<void()>;
 
     WgcSession() = default;
     ~WgcSession();
@@ -27,6 +32,7 @@ public:
     bool initialize(HMONITOR monitor, int fps, bool captureCursor);
     bool initialize(HWND window, int fps, bool captureCursor);
     void setFrameCallback(FrameCallback callback);
+    void setClosedCallback(ClosedCallback callback);
     bool start();
     void stop();
 
@@ -71,7 +77,10 @@ private:
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool framePool_{nullptr};
     winrt::Windows::Graphics::Capture::GraphicsCaptureSession session_{nullptr};
     winrt::event_token frameArrivedToken_{};
+    winrt::event_token closedToken_{};
     FrameCallback frameCallback_;
+    ClosedCallback closedCallback_;
+    std::atomic<bool> closedFired_{false};
     std::mutex callbackMutex_;
     int width_ = 0;
     int height_ = 0;

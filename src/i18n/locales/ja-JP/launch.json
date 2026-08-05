@@ -32,7 +32,10 @@
 		"loading": "ソースを読み込み中...",
 		"screens": "画面 ({{count}})",
 		"windows": "ウィンドウ ({{count}})",
-		"defaultSourceName": "画面"
+		"processes": "プロセス ({{count}})",
+		"processWindowCount": "{{count}} 個のウィンドウ",
+		"defaultSourceName": "画面",
+		"selectionHint": "{{count}} 個のソースを選択中 — 並行して録画されます。"
 	},
 	"recording": {
 		"selectSource": "録画するソースを選択してください"

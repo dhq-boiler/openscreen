@@ -671,7 +671,7 @@ export function LaunchWindow() {
 							className={`${hudIconBtnClasses} ${
 								cursorCaptureMode === "editable-overlay"
 									? "drop-shadow-[0_0_4px_rgba(74,222,128,0.4)]"
-									: ""
+									: "drop-shadow-[0_0_4px_rgba(96,165,250,0.4)]"
 							}`}
 							onClick={() =>
 								!recording &&
@@ -680,15 +680,17 @@ export function LaunchWindow() {
 								)
 							}
 							disabled={recording}
+							// Title shows CURRENT mode + click hint, so it is
+							// unambiguous what the icon colour means.
 							title={
 								cursorCaptureMode === "editable-overlay"
-									? t("cursor.useSystemCursor")
-									: t("cursor.useEditableCursor")
+									? `${t("cursor.useEditableCursor")} (click to switch)`
+									: `${t("cursor.useSystemCursor")} (click to switch)`
 							}
 						>
 							{getIcon(
 								"cursor",
-								cursorCaptureMode === "editable-overlay" ? "text-green-400" : "text-white/40",
+								cursorCaptureMode === "editable-overlay" ? "text-green-400" : "text-blue-400",
 							)}
 						</button>
 					)}

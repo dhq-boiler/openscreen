@@ -26,6 +26,15 @@ function getCursorSamplerCandidates(): string[] {
 		envPath,
 		resolve("electron", "native", "wgc-capture", "build", "cursor-sampler.exe"),
 		resolve("electron", "native", "bin", archTag, "cursor-sampler.exe"),
+		// Packaged builds ship the native helpers via electron-builder
+		// extraResources ("electron/native/bin" -> resources/electron/native/bin),
+		// NOT inside app.asar.unpacked. Without this candidate the sampler is
+		// unreachable in installed builds, editable-overlay recordings silently
+		// lose all cursor telemetry, and the editor has no cursor to draw.
+		// Mirrors resolvePackagedResourcePath() used for wgc-capture.exe.
+		app.isPackaged
+			? join(process.resourcesPath, "electron", "native", "bin", archTag, "cursor-sampler.exe")
+			: undefined,
 	].filter((c): c is string => Boolean(c));
 }
 

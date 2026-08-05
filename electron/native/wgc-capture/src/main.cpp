@@ -21,6 +21,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -387,12 +388,146 @@ void readCaptureCommands(CaptureControl& control, const std::function<void(bool)
     control.cv.notify_all();
 }
 
+struct EnumeratedWindow {
+    HWND hwnd = nullptr;
+    DWORD pid = 0;
+    std::string processName;
+    std::string processPath;
+    std::string title;
+    std::string className;
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+};
+
+std::string processPathFromPid(DWORD pid) {
+    if (pid == 0) {
+        return {};
+    }
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) {
+        return {};
+    }
+    std::wstring buffer(1024, L'\0');
+    DWORD size = static_cast<DWORD>(buffer.size());
+    std::string result;
+    if (QueryFullProcessImageNameW(process, 0, buffer.data(), &size)) {
+        buffer.resize(size);
+        result = wideToUtf8(buffer);
+    }
+    CloseHandle(process);
+    return result;
+}
+
+std::string basenameOfPath(const std::string& fullPath) {
+    if (fullPath.empty()) {
+        return {};
+    }
+    const size_t slash = fullPath.find_last_of("\\/");
+    return slash == std::string::npos ? fullPath : fullPath.substr(slash + 1);
+}
+
+BOOL CALLBACK enumWindowsCallback(HWND hwnd, LPARAM lparam) {
+    auto* out = reinterpret_cast<std::vector<EnumeratedWindow>*>(lparam);
+
+    // Skip invisible, minimized, or tool/cloaked windows so the list mirrors
+    // what desktopCapturer.getSources returns for the user's picker UI.
+    if (!IsWindowVisible(hwnd)) {
+        return TRUE;
+    }
+    if (IsIconic(hwnd)) {
+        return TRUE;
+    }
+    // Filter cloaked windows (UWP shell, hidden system windows).
+    BOOL cloaked = FALSE;
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) {
+        return TRUE;
+    }
+
+    const int titleLen = GetWindowTextLengthW(hwnd);
+    if (titleLen <= 0) {
+        // Untitled windows are almost never something the user recognises.
+        return TRUE;
+    }
+    std::wstring title(static_cast<size_t>(titleLen) + 1, L'\0');
+    const int copied = GetWindowTextW(hwnd, title.data(), titleLen + 1);
+    title.resize(static_cast<size_t>(std::max(0, copied)));
+
+    RECT rect{};
+    if (!GetWindowRect(hwnd, &rect)) {
+        return TRUE;
+    }
+    const int width = rect.right - rect.left;
+    const int height = rect.bottom - rect.top;
+    if (width <= 1 || height <= 1) {
+        return TRUE;
+    }
+
+    wchar_t classBuf[256] = {};
+    GetClassNameW(hwnd, classBuf, static_cast<int>(std::size(classBuf)));
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+
+    EnumeratedWindow entry;
+    entry.hwnd = hwnd;
+    entry.pid = pid;
+    entry.processPath = processPathFromPid(pid);
+    entry.processName = basenameOfPath(entry.processPath);
+    entry.title = wideToUtf8(title);
+    entry.className = wideToUtf8(std::wstring(classBuf));
+    entry.x = rect.left;
+    entry.y = rect.top;
+    entry.width = width;
+    entry.height = height;
+    out->push_back(std::move(entry));
+    return TRUE;
+}
+
+int emitWindowList() {
+    std::vector<EnumeratedWindow> windows;
+    EnumWindows(&enumWindowsCallback, reinterpret_cast<LPARAM>(&windows));
+
+    std::cout << "{\"schemaVersion\":1,\"windows\":[";
+    bool first = true;
+    for (const auto& w : windows) {
+        if (!first) {
+            std::cout << ",";
+        }
+        first = false;
+        const uintptr_t handleValue = reinterpret_cast<uintptr_t>(w.hwnd);
+        std::cout << "{\"hwnd\":" << static_cast<uint64_t>(handleValue)
+                  << ",\"sourceId\":\"window:" << static_cast<uint64_t>(handleValue) << ":0\""
+                  << ",\"pid\":" << w.pid
+                  << ",\"processName\":\"" << jsonEscape(w.processName) << "\""
+                  << ",\"processPath\":\"" << jsonEscape(w.processPath) << "\""
+                  << ",\"title\":\"" << jsonEscape(w.title) << "\""
+                  << ",\"className\":\"" << jsonEscape(w.className) << "\""
+                  << ",\"x\":" << w.x
+                  << ",\"y\":" << w.y
+                  << ",\"width\":" << w.width
+                  << ",\"height\":" << w.height
+                  << "}";
+    }
+    std::cout << "]}" << std::endl;
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "ERROR: Missing JSON config argument" << std::endl;
         return 1;
+    }
+
+    // Non-capture utility subcommand: enumerate visible top-level windows
+    // with their owning process. Emits a single JSON line on stdout, then
+    // exits. Used by the source picker to offer "record every window of
+    // process X" without spawning a capture pipeline.
+    if (std::string(argv[1]) == "--list-windows") {
+        return emitWindowList();
     }
 
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
@@ -717,6 +852,52 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // Neither PrintWindow nor the BitBlt screen copy includes the mouse
+        // cursor, so fabricated frames silently ERASE the cursor that real WGC
+        // frames bake in (IsCursorCaptureEnabled). Any time the scene goes
+        // still for >500ms the watchdog would otherwise replace the last good
+        // frame with a cursor-less one — making the cursor vanish whenever the
+        // user stops moving the mouse. Draw it back in manually.
+        if (ok && config.captureCursor) {
+            CURSORINFO ci{};
+            ci.cbSize = sizeof(CURSORINFO);
+            if (GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) && ci.hCursor) {
+                // Match WGC semantics: only bake the cursor when it actually
+                // hit-tests to the captured window (not when it hovers an
+                // overlapping window that happens to cover the same rect).
+                const HWND underCursor = WindowFromPoint(ci.ptScreenPos);
+                const bool cursorOverTarget =
+                    underCursor != nullptr &&
+                    (underCursor == hwnd || GetAncestor(underCursor, GA_ROOT) == hwnd);
+                ICONINFO ii{};
+                if (cursorOverTarget && GetIconInfo(ci.hCursor, &ii)) {
+                    // Both blit paths map the window-space box
+                    // (visX..visX+visW, visY..visY+visH) onto the output
+                    // buffer, so map the cursor through the same transform.
+                    // Coordinates all come from the same (DPI-consistent)
+                    // GDI space as winRect / frameRect above.
+                    const int cursorWinX =
+                        ci.ptScreenPos.x - winRect.left - static_cast<int>(ii.xHotspot);
+                    const int cursorWinY =
+                        ci.ptScreenPos.y - winRect.top - static_cast<int>(ii.yHotspot);
+                    const int drawX = static_cast<int>(
+                        (cursorWinX - visX) * (static_cast<double>(width) / visW));
+                    const int drawY = static_cast<int>(
+                        (cursorWinY - visY) * (static_cast<double>(height) / visH));
+                    // Size 0,0 without DI_DEFAULTSIZE = the cursor's actual
+                    // resource size, matching how WGC bakes it. GDI clips
+                    // draws outside the buffer, so no bounds check needed.
+                    DrawIconEx(outDC, drawX, drawY, ci.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
+                    if (ii.hbmMask) {
+                        DeleteObject(ii.hbmMask);
+                    }
+                    if (ii.hbmColor) {
+                        DeleteObject(ii.hbmColor);
+                    }
+                }
+            }
+        }
+
         if (ok) {
             printWindowBuffer.assign(static_cast<BYTE*>(outBits),
                                      static_cast<BYTE*>(outBits) + outByteCount);
@@ -731,6 +912,17 @@ int main(int argc, char* argv[]) {
         return ok;
     };
     bool loggedPrintWindowFallback = false;
+
+    // Route WGC's Closed event (source window destroyed / monitor unplugged)
+    // through the same stop path as an operator "stop" command. Without this
+    // the WGC pipeline can crash inside D3D/DWM (0xC0000409) shortly after the
+    // source disappears — most visibly when a dialog is dismissed mid-recording
+    // during a process-capture session, resulting in an mp4 without moov.
+    session.setClosedCallback([&]() {
+        std::cout << "{\"event\":\"source-closed\",\"schemaVersion\":2}" << std::endl;
+        control.stopRequested = true;
+        control.cv.notify_all();
+    });
 
     session.setFrameCallback([&](ID3D11Texture2D* texture, int64_t timestampHns) {
         if (control.stopRequested || control.paused) {
@@ -885,6 +1077,17 @@ int main(int argc, char* argv[]) {
                 std::this_thread::sleep_for(pollInterval);
                 if (control.stopRequested || encodeFailed || control.paused) {
                     continue;
+                }
+                // The source window may have been destroyed since capture
+                // started (dialog dismissed, process killed). Touching a
+                // dead HWND from PrintWindow / SetWindowLongPtrW / D3D
+                // UpdateSubresource is where the 0xC0000409 crash lives, so
+                // bail out and let the main loop finalize the mp4.
+                if (!IsWindow(hwnd)) {
+                    std::cout << "{\"event\":\"source-window-lost\",\"schemaVersion\":2}" << std::endl;
+                    control.stopRequested = true;
+                    control.cv.notify_all();
+                    return;
                 }
                 const auto lastArrived = session.lastFrameArrivedSteady();
                 const auto now = clock::now();
@@ -1126,6 +1329,17 @@ int main(int argc, char* argv[]) {
                 audioMixer->stop();
             }
             session.stop();
+            // Close the sink writer so the output mp4 gets a moov atom even
+            // when no frames were captured. Renderers/ffprobe treat a
+            // truncated file as unplayable; a properly-closed 0-duration
+            // file still probes cleanly and can be dropped by the caller.
+            {
+                std::scoped_lock lock(mutex);
+                encoder.finalize();
+                if (writeSeparateWebcam) {
+                    webcamEncoder.finalize();
+                }
+            }
             std::cerr << "ERROR: Timed out waiting for first WGC frame" << std::endl;
             return 1;
         }

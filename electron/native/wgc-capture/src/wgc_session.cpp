@@ -207,6 +207,14 @@ bool WgcSession::initialize(HMONITOR monitor, int fps, bool captureCursor) {
     }
 
     frameArrivedToken_ = framePool_.FrameArrived({this, &WgcSession::onFrameArrived});
+    // Subscribe to the item's Closed event so we can tell the main loop to
+    // finalize gracefully when the source monitor disappears (unplug, DPI
+    // reset). Without this the WGC/D3D pipeline can crash mid-frame.
+    closedToken_ = item_.Closed([this](auto&&, auto&&) {
+        if (closedFired_.exchange(true)) return;
+        std::scoped_lock lock(callbackMutex_);
+        if (closedCallback_) closedCallback_();
+    });
     return true;
 }
 
@@ -232,12 +240,25 @@ bool WgcSession::initialize(HWND window, int fps, bool captureCursor) {
     }
 
     frameArrivedToken_ = framePool_.FrameArrived({this, &WgcSession::onFrameArrived});
+    // Subscribe to the item's Closed event so a destroyed source window
+    // (dialog dismissed, app terminated) drives us to a clean shutdown
+    // instead of a 0xC0000409 crash inside FrameArrived / PrintWindow.
+    closedToken_ = item_.Closed([this](auto&&, auto&&) {
+        if (closedFired_.exchange(true)) return;
+        std::scoped_lock lock(callbackMutex_);
+        if (closedCallback_) closedCallback_();
+    });
     return true;
 }
 
 void WgcSession::setFrameCallback(FrameCallback callback) {
     std::scoped_lock lock(callbackMutex_);
     frameCallback_ = std::move(callback);
+}
+
+void WgcSession::setClosedCallback(ClosedCallback callback) {
+    std::scoped_lock lock(callbackMutex_);
+    closedCallback_ = std::move(callback);
 }
 
 bool WgcSession::start() {
@@ -254,6 +275,12 @@ bool WgcSession::start() {
 
 bool WgcSession::recreateFramePool() {
     if (!item_ || !winrtDevice_) {
+        return false;
+    }
+    // Don't touch WGC after Closed has fired — the underlying source is
+    // gone and any further WGC calls risk a 0xC0000409 crash inside the
+    // D3D/DWM pipeline.
+    if (closedFired_.load()) {
         return false;
     }
     // Detach the old listener and close the old pool / session first so
@@ -288,6 +315,14 @@ bool WgcSession::recreateFramePool() {
 void WgcSession::stop() {
     if (framePool_) {
         framePool_.FrameArrived(frameArrivedToken_);
+    }
+    if (item_ && closedToken_.value != 0) {
+        try {
+            item_.Closed(closedToken_);
+        } catch (...) {
+            // Item may already be closed / destroyed; ignore.
+        }
+        closedToken_ = {};
     }
     if (session_) {
         session_.Close();
